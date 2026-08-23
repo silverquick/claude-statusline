@@ -2,13 +2,19 @@
 
 `StatusLinePowerline` は、Claude Code から標準入力で渡される JSON を読み、ANSI カラー付きの Powerline 形式ステータス行を標準出力へ返す Rust 製のコンソールアプリケーションです。
 
-通常の `statusLine` では、次の情報を表示します。
+通常の `statusLine` では、次の情報を左から順に表示します。
 
-- モデルと Effort
-- コンテキスト使用量
-- 作業ディレクトリ
-- 5時間・7日間の利用率
-- Gitブランチ、ワークツリー、差分行数
+1. `ユーザー名@ホスト名`
+2. 作業ディレクトリ
+3. モデル
+4. Effort
+5. コンテキスト使用量（トークン数・使用率バー・パーセント）
+6. 5時間・7日間の利用率（使用率バー・パーセント・リセット時刻）
+7. Gitブランチ、ワークツリー、差分行数
+
+先頭2つはシェルの `PS1` に使われる `\u@\h:\w` と同じ並びで、そのあとにセッション情報、利用率、Git情報と続きます。項目名（`Model:`、`Cwd:` など）はセグメントの色と位置で区別できるため表示しません。時間窓を区別する必要がある `5h` / `7d` と、ブランチと紛らわしい `WT:` のみラベルを残しています。
+
+末尾の `(+154,-1163)` は `git diff --numstat HEAD --` の合計、つまり `HEAD` と比べた作業ツリーの増減行数です。ステージ済みと未ステージの両方を含み、未追跡ファイルは含みません。
 
 `--subagent` を付けると `subagentStatusLine` 用に動作し、サブエージェントごとの表示内容を JSON Lines で返します。
 
@@ -259,6 +265,11 @@ CLAUDE_CONFIG_DIR="$HOME/.claude-sol" claude
 - 作業ディレクトリ: `workspace.current_dir`、なければ `cwd`
 - 利用率: `rate_limits.five_hour`、`rate_limits.seven_day`
 
+`ユーザー名@ホスト名` だけは入力JSONではなく実行環境から取得します。ユーザー名は環境変数 `USER`、`LOGNAME`、`USERNAME` の順に探します。ホスト名は `/proc/sys/kernel/hostname`、`/etc/hostname`、環境変数 `HOSTNAME`、`HOST`、`COMPUTERNAME` の順に探し、`\h` と同じく最初のドットより前だけを使います。どちらか一方しか判定できない場合は、判定できたほうだけを表示します。
+
+> [!NOTE]
+> macOS には `/proc` がなく `/etc/hostname` も既定では存在しないため、シェルが `HOSTNAME` または `HOST` をエクスポートしていない場合はホスト名部分が省略され、ユーザー名だけの表示になります。
+
 入力に `rate_limits.five_hour` または `rate_limits.seven_day` のオブジェクト自体がない場合、不足している時間窓ごとに、`~/.claude.json` の `cachedUsageUtilization.utilization` を任意のフォールバックとして読みます。このファイルは必須ではありません。入力オブジェクトは存在しても `used_percentage` がない場合や、不足している時間窓のキャッシュ形式が異なる場合、読み取りに失敗した場合は、その時間窓だけを `--%` と表示します。
 
 Gitリポジトリは作業ディレクトリから親方向へ `.git` を探索します。通常のリポジトリでは `git diff --numstat HEAD --` により、`HEAD` と比較したステージ済み・未ステージの追跡対象変更を集計します。初回コミット前のリポジトリでは `git diff --cached --numstat <empty-tree> --` により、ステージ済み変更だけを空ツリーと比較します。どちらも3秒で打ち切り、未追跡ファイルは差分統計に含めません。
@@ -345,8 +356,9 @@ $binary = "$HOME/.local/bin/StatusLinePowerline.exe"
 - `cargo build --release`: 成功、警告0、エラー0
 - `cargo clippy --release --all-targets`: 指摘0
 - 成果物: 653KB、動的依存は `libc` と `libgcc` のみ
-- 起動時間: 約13ms/回（`git diff` 呼び出しを含む実リポジトリ上での50回平均）
+- 起動時間: 約14ms/回（`git diff` 呼び出しを含む実リポジトリ上での50回平均）
 - 通常モード: 終了コード0、標準エラーなし
+- `ユーザー名@ホスト名`: `/proc/sys/kernel/hostname` から短縮ホスト名を取得できることを確認
 - 異常入力（空、非JSON、JSON配列、型不一致）: いずれも終了コード0、標準エラーなし、該当項目のみフォールバック表示
 - `rate_limits` 欠落時の `~/.claude.json` フォールバック: 動作を確認
 - `used_percentage` 欠落時: `--%` とリセット時刻のみを表示

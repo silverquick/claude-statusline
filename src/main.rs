@@ -42,6 +42,7 @@ const RATE_HIGH_BACKGROUND: Color = rgb(192, 57, 43);
 const GIT_BACKGROUND: Color = rgb(41, 128, 185);
 const WORKTREE_BACKGROUND: Color = rgb(92, 72, 165);
 const DIFF_BACKGROUND: Color = rgb(39, 174, 96);
+const IDENTITY_BACKGROUND: Color = rgb(45, 106, 79);
 const WHITE: Color = rgb(255, 255, 255);
 const DARK_TEXT: Color = rgb(30, 36, 45);
 
@@ -116,26 +117,33 @@ fn build_status_line(root: &Value) -> String {
     let repository = find_repository(&directory, get_workspace_worktree(root));
 
     let context_foreground = get_context_foreground(context.percentage_value);
+    // 並び順はシェルの PS1 と同じく `\u@\h` → `\w` から始め、そのあとに
+    // セッション情報（モデル、Effort、コンテキスト）、利用率、Git情報と続く。
     let mut segments = vec![
+        Segment {
+            background: IDENTITY_BACKGROUND,
+            foreground: WHITE,
+            text: format!(" {} ", get_identity()),
+        },
+        Segment {
+            background: DIRECTORY_BACKGROUND,
+            foreground: WHITE,
+            text: format!(" {} ", format_directory(&directory)),
+        },
         Segment {
             background: MODEL_BACKGROUND,
             foreground: WHITE,
-            text: format!(" Model: {} ", get_model_name(root)),
+            text: format!(" {} ", get_model_name(root)),
         },
         Segment {
             background: EFFORT_BACKGROUND,
             foreground: WHITE,
-            text: format!(" Effort: {} ", get_main_effort(root)),
+            text: format!(" {} ", get_main_effort(root)),
         },
         Segment {
             background: get_context_background(context.percentage_value),
             foreground: context_foreground,
             text: create_context_text(&context, context_foreground),
-        },
-        Segment {
-            background: DIRECTORY_BACKGROUND,
-            foreground: WHITE,
-            text: format!(" Cwd: {} ", format_directory(&directory)),
         },
         create_rate_segment("5h", rates.five_hour),
         create_rate_segment("7d", rates.seven_day),
@@ -210,9 +218,9 @@ fn get_main_effort(root: &Value) -> String {
 
 fn create_context_text(context: &Context, foreground: Color) -> String {
     match context.percentage_value {
-        None => format!(" Ctx: {}/{} --% ", context.current, context.maximum),
+        None => format!(" {}/{} --% ", context.current, context.maximum),
         Some(value) => format!(
-            " Ctx: {}/{} {} {}% ",
+            " {}/{} {} {}% ",
             context.current,
             context.maximum,
             build_usage_bar(value, foreground),
@@ -483,6 +491,43 @@ fn trim_trailing_separators(value: &str) -> String {
     }
 
     trimmed.to_string()
+}
+
+/// シェルの `PS1` に含まれる `\u@\h` に相当する識別子。
+/// どちらか一方しか判定できない場合は、判定できたほうだけを表示する。
+fn get_identity() -> String {
+    let user = ["USER", "LOGNAME", "USERNAME"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .map(|value| clean_text(value.trim()))
+        .filter(|value| !value.is_empty());
+
+    match (user, read_short_hostname()) {
+        (Some(user), Some(host)) => format!("{}@{}", user, host),
+        (Some(user), None) => user,
+        (None, Some(host)) => host,
+        (None, None) => "?".to_string(),
+    }
+}
+
+/// `\h` と同じく、FQDN ではなく最初のドットより前だけを返す。
+fn read_short_hostname() -> Option<String> {
+    let raw = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+        .ok()
+        .or_else(|| {
+            ["HOSTNAME", "HOST", "COMPUTERNAME"]
+                .iter()
+                .find_map(|name| std::env::var(name).ok())
+        })?;
+
+    let short = clean_text(raw.trim().split('.').next()?);
+    let short = short.trim().to_string();
+    if short.is_empty() {
+        None
+    } else {
+        Some(short)
+    }
 }
 
 fn get_workspace_worktree(root: &Value) -> Option<String> {
