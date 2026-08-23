@@ -1,13 +1,6 @@
-# .NET ビルド成果物
-bin/
-obj/
-publish/
+# Rust ビルド成果物
+/target
 
 # ユーザー固有のIDE設定
-.vs/
 .vscode/
-*.user
-*.suo
-
-# デバッグシンボル
-*.pdb
+.idea/

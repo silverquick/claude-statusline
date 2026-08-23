@@ -1,6 +1,6 @@
 # StatusLinePowerline
 
-`StatusLinePowerline` は、Claude Code から標準入力で渡される JSON を読み、ANSI カラー付きの Powerline 形式ステータス行を標準出力へ返す .NET コンソールアプリケーションです。
+`StatusLinePowerline` は、Claude Code から標準入力で渡される JSON を読み、ANSI カラー付きの Powerline 形式ステータス行を標準出力へ返す Rust 製のコンソールアプリケーションです。
 
 通常の `statusLine` では、次の情報を表示します。
 
@@ -13,46 +13,62 @@
 `--subagent` を付けると `subagentStatusLine` 用に動作し、サブエージェントごとの表示内容を JSON Lines で返します。
 
 > [!IMPORTANT]
-> このプロジェクトはソース上ではクロスプラットフォームな .NET API を使用していますが、1つの実行ファイルをすべてのOSで共用することはできません。Windows、Linux、macOSそれぞれのOS・CPUに合うRIDを指定してpublishしてください。
+> ソースはクロスプラットフォームな標準ライブラリのみで書かれていますが、1つの実行ファイルをすべてのOSで共用することはできません。Windows、Linux、macOSそれぞれのOS・CPUに合うターゲットでビルドしてください。
 
 ## 必要条件
 
 ### ビルドするPC
 
-- .NET 10 SDK
+- Rust ツールチェーン（`cargo` を含む）
 
-プロジェクトは `net10.0` を対象としています。
+`Cargo.toml` は `rust-version = "1.74"` を宣言しています。動作検証は Rust 1.97.1 で行いました。
+
+依存クレートは2つだけです。
+
+| クレート | 用途 |
+| --- | --- |
+| `serde_json` | 標準入力のJSONと `~/.claude.json` の解析 |
+| `chrono` | 利用率リセット時刻のローカルタイムゾーン変換と書式化 |
 
 ### 実行するPC
 
-- 対象OS・CPUに対応する .NET 10 Runtime
 - Claude Code
 - UTF-8とANSI truecolorを扱えるターミナル
 - PowerlineまたはNerd Font対応フォント
 - 差分行数を表示する場合は、`PATH` 上の `git`
 
-プロジェクト設定は次のとおりです。
-
-- `PublishSingleFile=true`: アプリケーションを単一ファイルとしてpublishする
-- `SelfContained=false`: .NET Runtimeを実行ファイルへ同梱しない
-
-したがって、既定のpublish成果物は**単一ファイルですがフレームワーク依存**です。実行先には .NET 10 Runtimeが必要です。
+**別途ランタイムをインストールする必要はありません。** ビルド成果物は単体で動作するネイティブバイナリです（Linux では `libc` と `libgcc` のみに依存）。
 
 Git実行ファイルは必須ではありません。ブランチとワークツリーは `.git` メタデータから直接検出できます。`git` が必要なのは差分統計の取得だけで、取得できない情報は表示から省略されます。
 
-## 対象RID
+## 対象ターゲット
 
-プロジェクトファイルには固定の `RuntimeIdentifier` がありません。publish時に実行先に合うRIDを指定します。
+`Cargo.toml` に固定のターゲットはありません。実行先と同じOS・CPU上でビルドするのが最も簡単です。
 
-| 実行先 | x64 | Arm64 | 成果物名 |
-| --- | --- | --- | --- |
-| Windows | `win-x64` | `win-arm64` | `StatusLinePowerline.exe` |
-| Linux | `linux-x64` | `linux-arm64` | `StatusLinePowerline` |
-| macOS | `osx-x64` | `osx-arm64` | `StatusLinePowerline` |
+| 実行先 | ターゲットトリプル | 成果物名 |
+| --- | --- | --- |
+| Linux x64 | `x86_64-unknown-linux-gnu` | `StatusLinePowerline` |
+| Linux Arm64 | `aarch64-unknown-linux-gnu` | `StatusLinePowerline` |
+| macOS Intel | `x86_64-apple-darwin` | `StatusLinePowerline` |
+| macOS Apple Silicon | `aarch64-apple-darwin` | `StatusLinePowerline` |
+| Windows x64 | `x86_64-pc-windows-msvc` | `StatusLinePowerline.exe` |
+| Windows Arm64 | `aarch64-pc-windows-msvc` | `StatusLinePowerline.exe` |
 
-Linuxの例は標準的なglibc環境を対象としています。Alpine Linuxなどのmusl環境は `linux-musl-*` RIDによる別publishと実機検証が必要です。
+Linuxの `*-linux-gnu` は標準的なglibc環境を対象としています。Alpine Linuxなどのmusl環境は `*-unknown-linux-musl` ターゲットによる別ビルドと実機検証が必要です。
 
-macOSではIntel Macに `osx-x64`、Apple Siliconに `osx-arm64` を使用します。このリポジトリは署名・notarization済みバイナリの配布を前提としていません。
+macOSではIntel Macに `x86_64-apple-darwin`、Apple Siliconに `aarch64-apple-darwin` を使用します。このリポジトリは署名・notarization済みバイナリの配布を前提としていません。
+
+### クロスコンパイルについて
+
+別OS・別CPU向けのビルドには、`rustup target add <target>` に加えて**そのターゲット用のリンカ**が必要です。
+
+| 元 → 先 | 追加で必要なもの |
+| --- | --- |
+| Linux → Linux Arm64 | `gcc-aarch64-linux-gnu`（+ `.cargo/config.toml` でリンカ指定） |
+| Linux → Windows | `mingw-w64` と `x86_64-pc-windows-gnu` ターゲット |
+| Linux → macOS | Apple SDKが必要なため実質困難。macOSランナー上でのビルドを推奨 |
+
+実行先と同じOS上でビルドできるなら、そちらのほうが確実です。
 
 ## ソース、生成物、設定の役割
 
@@ -60,10 +76,9 @@ macOSではIntel Macに `osx-x64`、Apple Siliconに `osx-arm64` を使用しま
 
 | 対象 | 役割 | 推奨例 |
 | --- | --- | --- |
-| ソースディレクトリ | `Program.cs` と `.csproj` を編集・ビルドする場所 | 任意のチェックアウト先 |
-| `bin/`、`obj/` | `dotnet build` やrestoreが作る一時生成物 | インストール先には使わない |
-| リポジトリ内の `publish/` | ローカルpublishで使う場合がある生成物 | 他PC向けの共通バイナリとは扱わない |
-| インストール先 | Claude Codeが実際に起動する固定パス | `$HOME/.local/bin/claude-statusline` |
+| ソースディレクトリ | `src/main.rs` と `Cargo.toml` を編集・ビルドする場所 | 任意のチェックアウト先 |
+| `target/` | `cargo build` が作る生成物 | インストール先には使わない |
+| インストール先 | Claude Codeが実際に起動する固定パス | `$HOME/.local/bin/StatusLinePowerline` |
 | Claude Code設定 | 実行するstatuslineコマンドを指定する | `~/.claude/settings.json` |
 | 別のユーザー設定ディレクトリ | Claudexなどの分離構成 | 例: `~/.claude-sol/settings.json` |
 
@@ -71,74 +86,61 @@ macOSではIntel Macに `osx-x64`、Apple Siliconに `osx-arm64` を使用しま
 
 ```text
 ソース
-  └─ dotnet publish -r <RID>
-       └─ ユーザー別インストール先
+  └─ cargo install --path . --root <prefix>
+       └─ <prefix>/bin/StatusLinePowerline
             └─ settings.json の command が起動
                  └─ stdin JSON → StatusLinePowerline → stdout
 ```
 
-`dotnet build` で `bin/Release/...` が更新されても、Claude Codeの設定が別のインストール先を参照していれば表示は更新されません。実際に設定している場所へ `dotnet publish` してください。
+`cargo build` で `target/release/` が更新されても、Claude Codeの設定が別のインストール先を参照していれば表示は更新されません。ソースを変更したら、実際に設定している場所へ再インストールしてください。
 
-## ビルドとpublish
+## ビルドとインストール
 
 以下のコマンドは、ソースディレクトリで実行します。
 
 ### 開発用ビルド
 
 ```sh
-dotnet build StatusLinePowerline.csproj -c Release
+cargo build --release
 ```
 
-`build` は開発用出力を `bin/` に作ります。OS・CPU別に配置する単一ファイルを作る操作は `publish` です。
+成果物は `target/release/StatusLinePowerline`（Windowsでは `.exe`）です。この場所のまま設定から参照することもできますが、`cargo clean` で消えるため恒久的なインストール先には向きません。
 
-### publishの基本形
+### インストール
+
+`cargo install` は、ビルドと固定パスへの配置をまとめて行います。`--root <prefix>` を指定すると `<prefix>/bin/` へ配置されます。
 
 ```sh
-dotnet publish StatusLinePowerline.csproj -c Release -r <RID> --self-contained false -o <install-directory>
-```
-
-Windowsの `.exe` をLinuxやmacOSへコピーしても動作しません。実行先のOS・CPUに合うRIDでpublishしてください。
-
-## OS別のインストール
-
-以下では、管理者権限を必要としないユーザー別ディレクトリへ直接publishします。
-
-### Windows
-
-PowerShellで `win-x64` または `win-arm64` を選択します。
-
-```powershell
-$installDir = "$HOME/.local/bin/claude-statusline"
-dotnet publish .\StatusLinePowerline.csproj -c Release -r win-x64 --self-contained false -o $installDir
+cargo install --path . --root "$HOME/.local" --locked
 ```
 
 成果物:
 
 ```text
-C:/Users/<user>/.local/bin/claude-statusline/StatusLinePowerline.exe
+$HOME/.local/bin/StatusLinePowerline
 ```
 
-### Linux
+`--locked` は `Cargo.lock` に記録されたバージョンをそのまま使う指定です。実行権限は `cargo install` が付与するため、`chmod` は不要です。
 
-`linux-x64` または `linux-arm64` を選択します。
+ソースを変更して入れ直す場合も、同じコマンドを再実行します（`--force` は不要です）。
+
+### 手動配置
+
+インストール先を細かく制御したい場合は、ビルドしてから任意の場所へコピーします。
 
 ```sh
-install_dir="$HOME/.local/bin/claude-statusline"
-mkdir -p "$install_dir"
-dotnet publish StatusLinePowerline.csproj -c Release -r linux-x64 --self-contained false -o "$install_dir"
-chmod 755 "$install_dir/StatusLinePowerline"
+cargo build --release
+install -Dm755 target/release/StatusLinePowerline "$HOME/.local/bin/claude-statusline/StatusLinePowerline"
 ```
 
-### macOS
-
-Intel Macでは `osx-x64`、Apple Siliconでは `osx-arm64` を選択します。
+### クロスコンパイルする場合
 
 ```sh
-install_dir="$HOME/.local/bin/claude-statusline"
-mkdir -p "$install_dir"
-dotnet publish StatusLinePowerline.csproj -c Release -r osx-arm64 --self-contained false -o "$install_dir"
-chmod 755 "$install_dir/StatusLinePowerline"
+rustup target add aarch64-unknown-linux-gnu
+cargo build --release --target aarch64-unknown-linux-gnu
 ```
+
+成果物は `target/<target>/release/StatusLinePowerline` に出ます。前述のとおり、ターゲット用リンカが別途必要です。
 
 ## Claude Codeの設定
 
@@ -165,36 +167,17 @@ chmod 755 "$install_dir/StatusLinePowerline"
 
 `command` はシェルで実行されます。公式ドキュメントで使われる非引用の `~` はホームディレクトリへ展開され、Windowsでも利用できます。一方、引用符で囲んだ `~` はPOSIXシェルで展開されません。以下では配置先を明確にするため、`<user>` を実際のユーザー名へ置き換える絶対パスを使用します。
 
-### Windows
-
-Windowsでは、Git BashがインストールされていればstatuslineコマンドはGit Bashで、なければPowerShellで実行されます。Git Bashでは非引用のバックスラッシュがエスケープとして扱われるため、コマンド内のWindowsパスは前方スラッシュで記述します。
-
-PowerShellでは引用したパスだけでは実行されず、呼び出し演算子 `&` が必要です。次の例は、どちらのシェルが選ばれても同じように動作するようPowerShellを明示的に起動します。
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "powershell -NoProfile -Command \"& 'C:/Users/<user>/.local/bin/claude-statusline/StatusLinePowerline.exe'\""
-  },
-  "subagentStatusLine": {
-    "type": "command",
-    "command": "powershell -NoProfile -Command \"& 'C:/Users/<user>/.local/bin/claude-statusline/StatusLinePowerline.exe' --subagent\""
-  }
-}
-```
-
 ### Linux
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "'/home/<user>/.local/bin/claude-statusline/StatusLinePowerline'"
+    "command": "'/home/<user>/.local/bin/StatusLinePowerline'"
   },
   "subagentStatusLine": {
     "type": "command",
-    "command": "'/home/<user>/.local/bin/claude-statusline/StatusLinePowerline' --subagent"
+    "command": "'/home/<user>/.local/bin/StatusLinePowerline' --subagent"
   }
 }
 ```
@@ -205,11 +188,30 @@ PowerShellでは引用したパスだけでは実行されず、呼び出し演�
 {
   "statusLine": {
     "type": "command",
-    "command": "'/Users/<user>/.local/bin/claude-statusline/StatusLinePowerline'"
+    "command": "'/Users/<user>/.local/bin/StatusLinePowerline'"
   },
   "subagentStatusLine": {
     "type": "command",
-    "command": "'/Users/<user>/.local/bin/claude-statusline/StatusLinePowerline' --subagent"
+    "command": "'/Users/<user>/.local/bin/StatusLinePowerline' --subagent"
+  }
+}
+```
+
+### Windows
+
+Windowsでは、Git BashがインストールされていればstatuslineコマンドはGit Bashで、なければPowerShellで実行されます。Git Bashでは非引用のバックスラッシュがエスケープとして扱われるため、コマンド内のWindowsパスは前方スラッシュで記述します。
+
+PowerShellでは引用したパスだけでは実行されず、呼び出し演算子 `&` が必要です。次の例は、どちらのシェルが選ばれても同じように動作するようPowerShellを明示的に起動します。
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "powershell -NoProfile -Command \"& 'C:/Users/<user>/.local/bin/StatusLinePowerline.exe'\""
+  },
+  "subagentStatusLine": {
+    "type": "command",
+    "command": "powershell -NoProfile -Command \"& 'C:/Users/<user>/.local/bin/StatusLinePowerline.exe' --subagent\""
   }
 }
 ```
@@ -241,7 +243,7 @@ CLAUDE_CONFIG_DIR="$HOME/.claude-sol" claude
 
 `CLAUDE_CONFIG_DIR` はユーザー設定、履歴、プラグインなどのユーザー構成を分離します。一方、ワークスペース内の `.claude/settings.json` と `.claude/settings.local.json` はプロジェクトファイルなので、この変数では分離されません。
 
-また、このアプリケーションの利用率フォールバックは、現在 `CLAUDE_CONFIG_DIR` ではなくOSのユーザーホーム直下にある `~/.claude.json` を読みます。別の設定ディレクトリを使っていても、statusline入力に利用率が含まれていれば通常どおり表示できます。キャッシュを参照するのは、入力に `rate_limits.five_hour` または `rate_limits.seven_day` のオブジェクト自体がない場合だけです。オブジェクトは存在しても `used_percentage` がない場合は、キャッシュへフォールバックせず `--%` になります。
+また、このアプリケーションの利用率フォールバックは、現在 `CLAUDE_CONFIG_DIR` ではなく環境変数 `HOME` 直下にある `~/.claude.json` を読みます。別の設定ディレクトリを使っていても、statusline入力に利用率が含まれていれば通常どおり表示できます。キャッシュを参照するのは、入力に `rate_limits.five_hour` または `rate_limits.seven_day` のオブジェクト自体がない場合だけです。オブジェクトは存在しても `used_percentage` がない場合は、キャッシュへフォールバックせず `--%` になります。
 
 ## 入出力契約
 
@@ -257,11 +259,11 @@ CLAUDE_CONFIG_DIR="$HOME/.claude-sol" claude
 - 作業ディレクトリ: `workspace.current_dir`、なければ `cwd`
 - 利用率: `rate_limits.five_hour`、`rate_limits.seven_day`
 
-入力に `rate_limits.five_hour` または `rate_limits.seven_day` のオブジェクト自体がない場合、不足している時間窓ごとに、OSのユーザーホーム直下にある `~/.claude.json` の `cachedUsageUtilization.utilization` を任意のフォールバックとして読みます。このファイルは必須ではありません。入力オブジェクトは存在しても `used_percentage` がない場合や、不足している時間窓のキャッシュ形式が異なる場合、読み取りに失敗した場合は、その時間窓だけを `--%` と表示します。
+入力に `rate_limits.five_hour` または `rate_limits.seven_day` のオブジェクト自体がない場合、不足している時間窓ごとに、`~/.claude.json` の `cachedUsageUtilization.utilization` を任意のフォールバックとして読みます。このファイルは必須ではありません。入力オブジェクトは存在しても `used_percentage` がない場合や、不足している時間窓のキャッシュ形式が異なる場合、読み取りに失敗した場合は、その時間窓だけを `--%` と表示します。
 
 Gitリポジトリは作業ディレクトリから親方向へ `.git` を探索します。通常のリポジトリでは `git diff --numstat HEAD --` により、`HEAD` と比較したステージ済み・未ステージの追跡対象変更を集計します。初回コミット前のリポジトリでは `git diff --cached --numstat <empty-tree> --` により、ステージ済み変更だけを空ツリーと比較します。どちらも3秒で打ち切り、未追跡ファイルは差分統計に含めません。
 
-無効なJSONや内部例外はClaude CodeのUIを妨げないよう静かに処理され、プロセスは終了コード0で終了します。
+無効なJSONや内部エラーはClaude CodeのUIを妨げないよう静かに処理され、プロセスは終了コード0で終了します。パニックも捕捉されるため、標準エラー出力へ何かが漏れることはありません。
 
 ### `--subagent` モード
 
@@ -277,30 +279,12 @@ Gitリポジトリは作業ディレクトリから親方向へ `.git` を探索
 
 インストール後、Claude Codeを起動する前に直接実行できます。
 
-### Windows PowerShell
-
-通常モード:
-
-```powershell
-$binary = "$HOME/.local/bin/claude-statusline/StatusLinePowerline.exe"
-'{"model":{"display_name":"Example"},"workspace":{"current_dir":"C:\\work"},"context_window":{"total_input_tokens":12000,"context_window_size":200000},"rate_limits":{"five_hour":{"used_percentage":10},"seven_day":{"used_percentage":20}}}' |
-  & $binary
-```
-
-サブエージェントモード:
-
-```powershell
-$binary = "$HOME/.local/bin/claude-statusline/StatusLinePowerline.exe"
-'{"columns":80,"tasks":[{"id":"task-1","model":"claude-opus-5","effort":"high","tokenCount":12000,"contextWindowSize":200000,"description":"status check"}]}' |
-  & $binary --subagent
-```
-
 ### Linux/macOS
 
 通常モード:
 
 ```sh
-binary="$HOME/.local/bin/claude-statusline/StatusLinePowerline"
+binary="$HOME/.local/bin/StatusLinePowerline"
 printf '%s\n' '{"model":{"display_name":"Example"},"workspace":{"current_dir":"/tmp/project"},"context_window":{"total_input_tokens":12000,"context_window_size":200000}}' |
   "$binary"
 ```
@@ -308,9 +292,27 @@ printf '%s\n' '{"model":{"display_name":"Example"},"workspace":{"current_dir":"/
 サブエージェントモード:
 
 ```sh
-binary="$HOME/.local/bin/claude-statusline/StatusLinePowerline"
+binary="$HOME/.local/bin/StatusLinePowerline"
 printf '%s\n' '{"tasks":[{"id":"task-1","model":"claude-opus-5","effort":"high","tokenCount":12000,"contextWindowSize":200000,"description":"status check"}]}' |
   "$binary" --subagent
+```
+
+### Windows PowerShell
+
+通常モード:
+
+```powershell
+$binary = "$HOME/.local/bin/StatusLinePowerline.exe"
+'{"model":{"display_name":"Example"},"workspace":{"current_dir":"C:\\work"},"context_window":{"total_input_tokens":12000,"context_window_size":200000},"rate_limits":{"five_hour":{"used_percentage":10},"seven_day":{"used_percentage":20}}}' |
+  & $binary
+```
+
+サブエージェントモード:
+
+```powershell
+$binary = "$HOME/.local/bin/StatusLinePowerline.exe"
+'{"columns":80,"tasks":[{"id":"task-1","model":"claude-opus-5","effort":"high","tokenCount":12000,"contextWindowSize":200000,"description":"status check"}]}' |
+  & $binary --subagent
 ```
 
 通常モードはANSI装飾済みの1本のstatuslineを返します。`--subagent` は `{ "id", "content" }` のJSONオブジェクトを1行ずつ返します。色やグリフの見え方はターミナルとフォントに依存します。
@@ -319,10 +321,11 @@ printf '%s\n' '{"tasks":[{"id":"task-1","model":"claude-opus-5","effort":"high",
 
 | 現象 | 確認・対処 |
 | --- | --- |
-| `dotnet build` 後も表示が古い | `build` は設定が参照するインストール先を更新しません。正しいRIDと `-o` で、設定内のパスへ再度 `dotnet publish` します。 |
-| statuslineが表示されない | 実行ファイルをスモークテストで直接実行し、絶対パス、設定JSON、.NET 10 Runtimeを確認します。 |
-| `Permission denied`（Linux/macOS） | `chmod 755 "$HOME/.local/bin/claude-statusline/StatusLinePowerline"` を実行します。ホームが `noexec` の場合は別のユーザー所有ディレクトリへ配置し、設定の絶対パスも更新します。 |
-| `Exec format error` | 実行先のOS・CPUと異なるRIDの成果物です。対象に合うRIDで再publishします。 |
+| `cargo build` 後も表示が古い | `build` は設定が参照するインストール先を更新しません。`cargo install --path . --root <prefix>` で、設定内のパスへ再インストールします。 |
+| statuslineが表示されない | 実行ファイルをスモークテストで直接実行し、絶対パスと設定JSONを確認します。 |
+| `Permission denied`（Linux/macOS） | `chmod 755` を実行します。ホームが `noexec` の場合は別のユーザー所有ディレクトリへ配置し、設定の絶対パスも更新します。 |
+| `Exec format error` | 実行先のOS・CPUと異なるターゲットの成果物です。対象に合うターゲットで再ビルドします。 |
+| リンカのエラーでクロスビルドが失敗する | ターゲット用のリンカ（`mingw-w64`、`gcc-aarch64-linux-gnu` など）を導入し、`.cargo/config.toml` で指定します。 |
 | Windowsでコマンドを実行できない | Windows設定例どおり前方スラッシュのパスを使い、PowerShellの `&` 呼び出し演算子を含めます。 |
 | 色や区切りが崩れる | ANSI truecolor対応端末とPowerline/Nerd Fontを確認します。 |
 | モデル、Effort、コンテキストが `?` や `--` になる | Claude Codeから渡されたJSONの該当フィールドがないか、形式が異なります。 |
@@ -331,23 +334,28 @@ printf '%s\n' '{"tasks":[{"id":"task-1","model":"claude-opus-5","effort":"high",
 | Git差分だけが出ない | `git` が `PATH` 上にあること、差分があること、3秒以内に完了することを確認します。未追跡ファイルは対象外です。 |
 | `--subagent` が何も返さない | `tasks` が配列で、各対象に空でない `id` と表示可能なモデル・Effort・トークン情報があることを確認します。 |
 
+## 経緯
+
+このアプリケーションは当初 .NET 10 / C# で書かれていました（`Program.cs`、`StatusLinePowerline.csproj`）。実行先に .NET Runtime を要求する点と、statuslineの更新ごとに発生する起動コストを避けるため、外部から見た動作を変えずに Rust へ移植しました。C# 版はgit履歴に残っています。
+
 ## 検証状況
 
-このドキュメントの作成時に、次を確認しています。
+`x86_64-unknown-linux-gnu`（Ubuntu 22.04、glibc 2.35、Rust 1.97.1）で次を確認しています。
 
-- `dotnet build StatusLinePowerline.csproj -c Release`: 成功、警告0、エラー0
-- 一時ディレクトリへのcross-RID publish:
-  - `win-x64`: 成功
-  - `win-arm64`: 成功
-  - `linux-x64`: 成功
-  - `linux-arm64`: 成功
-  - `osx-x64`: 成功
-  - `osx-arm64`: 成功
-- `win-x64`成果物の通常モード: 終了コード0、標準エラーなし
-- `win-x64`成果物の `--subagent` モード: 終了コード0、標準エラーなし、JSON Linesを確認
-- README内のJSON設定例: 構文確認済み
+- `cargo build --release`: 成功、警告0、エラー0
+- `cargo clippy --release --all-targets`: 指摘0
+- 成果物: 653KB、動的依存は `libc` と `libgcc` のみ
+- 起動時間: 約13ms/回（`git diff` 呼び出しを含む実リポジトリ上での50回平均）
+- 通常モード: 終了コード0、標準エラーなし
+- 異常入力（空、非JSON、JSON配列、型不一致）: いずれも終了コード0、標準エラーなし、該当項目のみフォールバック表示
+- `rate_limits` 欠落時の `~/.claude.json` フォールバック: 動作を確認
+- `used_percentage` 欠落時: `--%` とリセット時刻のみを表示
+- `current_usage` の内訳合算: 動作を確認
+- Git: 通常リポジトリの差分行数、初回コミット前リポジトリのステージ済み差分、linked worktree（`WT:` セグメントと `commondir` 経由の参照解決）、`workspace.git_worktree` による上書き、detached HEADの8桁表示
+- `--subagent` モード: 終了コード0、標準エラーなし、JSON Linesを確認。モデル名整形、日付サフィックス除去、`columns` に応じた説明の切り詰めを確認
+- `cargo install --path . --root <prefix> --locked`: 成功、`<prefix>/bin/StatusLinePowerline` を確認
 
-cross-RID publishの成功は、対象OS上でのネイティブ実行確認ではありません。Linux/macOSの実行、ターミナル表示、Claude Code経由の動作は、それぞれの実機で別途確認してください。
+Windows、macOS、Arm64 Linux でのビルドと実行は未検証です。それぞれの実機で別途確認してください。
 
 ## 参考資料
 
