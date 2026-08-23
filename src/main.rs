@@ -721,6 +721,66 @@ fn read_short_hostname() -> Option<String> {
     }
 }
 
+/// サブエージェント行の入力には Effort が入っていない。タスクが自前の Effort を
+/// 持つのは明示指定されたときだけで、セッションの値を継承している場合は
+/// `task.effort` が省略される。さらに、メインの statusline には届く
+/// トップレベルの `effort` も、statusline の再描画は tool-use コンテキストの
+/// イベントではないため送られてこない。
+///
+/// 入力に含まれる `transcript_path` から実際に使われている Effort を読み戻す。
+/// 会話ログの末尾から、sidechain（サブエージェント自身の発話）でない
+/// assistant 行を1件見つけるだけなので、全体を読む必要はない。
+/// 形式は公開仕様ではないので、読めなければゲージを出さないだけに留める。
+fn get_transcript_effort(root: &Value) -> Option<String> {
+    const TAIL_BYTES: u64 = 256 * 1024;
+
+    let path = get_string(root, "transcript_path")?;
+    let tail = read_file_tail(Path::new(path), TAIL_BYTES)?;
+
+    let mut lines: Vec<&str> = tail.lines().collect();
+    // 先頭行は途中で切れている可能性があるので捨てる。
+    if tail.len() as u64 >= TAIL_BYTES && !lines.is_empty() {
+        lines.remove(0);
+    }
+
+    for line in lines.iter().rev() {
+        if !line.contains("\"effort\"") {
+            continue;
+        }
+
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if entry.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+
+        let effort = entry.get("effort")?;
+        let level = effort
+            .as_str()
+            .or_else(|| effort.as_object().and_then(|_| get_string(effort, "level")));
+        if let Some(level) = level.filter(|value| !is_blank(value)) {
+            return Some(clean_text(level.trim()));
+        }
+    }
+
+    None
+}
+
+/// ファイル末尾から最大 `limit` バイトを読む。会話ログは数メガバイトになるので、
+/// 毎秒の再描画で全体を読まないようにする。
+fn read_file_tail(path: &Path, limit: u64) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(length.saturating_sub(limit))).ok()?;
+
+    let mut buffer = Vec::new();
+    file.take(limit).read_to_end(&mut buffer).ok()?;
+    Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
 fn get_session_cost(root: &Value) -> Option<f64> {
     get_object(root, "cost")
         .and_then(|cost| get_number(cost, "total_cost_usd"))
@@ -1221,7 +1281,7 @@ fn write_subagent_status(root: &Value) {
         return;
     };
 
-    let session_effort = get_effort(root);
+    let session_effort = get_effort(root).or_else(|| get_transcript_effort(root));
     let columns = get_number(root, "columns").filter(|value| *value > 0.0).map(|value| value as i64);
 
     for task in tasks {
