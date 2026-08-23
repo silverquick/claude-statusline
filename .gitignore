@@ -1,0 +1,13 @@
+# .NET ビルド成果物
+bin/
+obj/
+publish/
+
+# ユーザー固有のIDE設定
+.vs/
+.vscode/
+*.user
+*.suo
+
+# デバッグシンボル
+*.pdb
