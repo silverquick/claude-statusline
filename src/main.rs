@@ -55,6 +55,7 @@ const GIT_BACKGROUND: Color = rgb(29, 90, 130);
 const WORKTREE_BACKGROUND: Color = rgb(92, 72, 165);
 const DIFF_BACKGROUND: Color = rgb(39, 174, 96);
 const IDENTITY_BACKGROUND: Color = rgb(45, 106, 79);
+const COST_BACKGROUND: Color = rgb(176, 187, 200);
 const WHITE: Color = rgb(255, 255, 255);
 const DARK_TEXT: Color = rgb(30, 36, 45);
 
@@ -75,12 +76,33 @@ const BAR_EMPTY_FOREGROUND: Color = rgb(78, 86, 102);
 // はっきり暗くしている。塗りは1本の紫系ランプで、位置が上がるほど明るい。
 // Effort が高いほど明るい段まで届き、ゲージ全体が強く見える。
 const EFFORT_STEPS: usize = 5;
-const EFFORT_FILLED_BACKGROUNDS: [Color; EFFORT_STEPS] = [
-    rgb(135, 103, 184),
-    rgb(159, 127, 204),
-    rgb(182, 153, 223),
-    rgb(205, 179, 238),
-    rgb(226, 208, 248),
+// 点灯色は時間で少しずつ色相が動く。statusline の再描画は `refreshInterval`
+// の最小値である1秒に1回が上限なので、1フレームあたりの変化を色差 4.4 に
+// 抑え、1周 14 秒でゆっくり流す。
+//
+// 動かすのは色相だけで、明度は段ごとに固定している。Lab では輝度が L* だけ
+// で決まるため、色相回転では点灯・未点灯の輝度比が数学的に変わらない。段の
+// 順序も崩れない。全段を同じ位相で動かすのは、段ごとにずらすと瞬間の色相幅
+// が 16 度を超えて「5段が別々の色」に見えてしまうため。
+//
+// 実行時に色空間の変換をせずに済むよう、また全位相を試験できるよう、
+// 値は事前に計算して表として持つ。
+const EFFORT_PHASES: usize = 14;
+const EFFORT_FILLED_ANIMATION: [[Color; EFFORT_STEPS]; EFFORT_PHASES] = [
+    [rgb(134, 106, 176), rgb(157, 129, 197), rgb(181, 154, 216), rgb(203, 181, 233), rgb(225, 209, 244)],
+    [rgb(143, 103, 171), rgb(166, 127, 192), rgb(188, 152, 212), rgb(210, 179, 229), rgb(229, 208, 242)],
+    [rgb(150, 100, 166), rgb(173, 125, 188), rgb(194, 150, 208), rgb(215, 178, 226), rgb(232, 207, 239)],
+    [rgb(153, 99, 164), rgb(176, 123, 185), rgb(197, 149, 205), rgb(217, 177, 224), rgb(234, 206, 238)],
+    [rgb(153, 99, 164), rgb(176, 123, 185), rgb(197, 149, 205), rgb(217, 177, 224), rgb(234, 206, 238)],
+    [rgb(150, 100, 166), rgb(173, 125, 188), rgb(194, 150, 208), rgb(215, 178, 226), rgb(232, 207, 239)],
+    [rgb(143, 103, 171), rgb(166, 127, 192), rgb(188, 152, 212), rgb(210, 179, 229), rgb(229, 208, 242)],
+    [rgb(134, 106, 176), rgb(157, 129, 197), rgb(181, 154, 216), rgb(203, 181, 233), rgb(225, 209, 244)],
+    [rgb(124, 109, 180), rgb(148, 132, 201), rgb(172, 157, 220), rgb(196, 183, 236), rgb(220, 210, 246)],
+    [rgb(115, 111, 183), rgb(140, 134, 204), rgb(165, 159, 222), rgb(191, 184, 238), rgb(216, 211, 248)],
+    [rgb(110, 112, 184), rgb(135, 135, 205), rgb(161, 160, 223), rgb(187, 185, 239), rgb(214, 212, 248)],
+    [rgb(110, 112, 184), rgb(135, 135, 205), rgb(161, 160, 223), rgb(187, 185, 239), rgb(214, 212, 248)],
+    [rgb(115, 111, 183), rgb(140, 134, 204), rgb(165, 159, 222), rgb(191, 184, 238), rgb(216, 211, 248)],
+    [rgb(124, 109, 180), rgb(148, 132, 201), rgb(172, 157, 220), rgb(196, 183, 236), rgb(220, 210, 246)],
 ];
 const EFFORT_EMPTY_BACKGROUND: Color = rgb(35, 29, 41);
 // 未点灯セルには使用率バーと同じ `░` を置く。色だけに頼らない手がかりを
@@ -201,6 +223,17 @@ fn build_status_line(root: &Value) -> String {
         create_rate_segment("7d", rates.seven_day, RateScale::Light),
     ];
 
+    // Claude Code が渡すのはこのセッションの推定コストだけで、アカウントの
+    // 課金上限や当月の使用量は入力に含まれない。上限がないのでバーは置かず、
+    // 金額だけを出す。`/clear` で 0 に戻る。
+    if let Some(cost) = get_session_cost(root) {
+        segments.push(Segment {
+            background: COST_BACKGROUND,
+            foreground: DARK_TEXT,
+            text: format!(" ${} ", format_fixed(cost, 2)),
+        });
+    }
+
     if let Some(repository) = repository {
         if let Some(branch) = repository.branch.as_deref() {
             segments.push(Segment {
@@ -273,9 +306,18 @@ fn get_main_effort(root: &Value) -> String {
 /// 未知の値や `--` のときは、置く位置が決められないのでゲージを出さない。
 fn create_effort_text(label: &str) -> String {
     match get_effort_step(label) {
-        Some(step) => format!(" {} {} ", label, build_effort_gauge(step)),
+        Some(step) => format!(" {} {} ", label, build_effort_gauge(step, current_phase())),
         None => format!(" {} ", label),
     }
+}
+
+/// 経過秒からアニメーションの位相を決める。時刻が取れない場合は固定の位相に
+/// 落ちるだけで、表示そのものは壊れない。
+fn current_phase() -> usize {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| (elapsed.as_secs() % EFFORT_PHASES as u64) as usize)
+        .unwrap_or(0)
 }
 
 /// Claude Code の Effort は `low` / `medium` / `high` / `xhigh` / `max` の5段階。
@@ -296,11 +338,11 @@ fn get_effort_step(label: &str) -> Option<usize> {
 /// 5段を斜めの境界でつないだゲージ。各段は「区切り＋1マスの地」でできており、
 /// 区切りの前景に前の段の色、背景に次の段の色を置くことで台形が連続して見える。
 /// 最後にセグメント本来の色へ戻すので、外側の Powerline 接続には影響しない。
-fn build_effort_gauge(step: usize) -> String {
+fn build_effort_gauge(step: usize, phase: usize) -> String {
     let mut gauge = String::new();
     let mut previous = EFFORT_BACKGROUND;
 
-    for (index, filled) in EFFORT_FILLED_BACKGROUNDS.into_iter().enumerate() {
+    for (index, filled) in EFFORT_FILLED_ANIMATION[phase % EFFORT_PHASES].into_iter().enumerate() {
         let current = if index < step {
             filled
         } else {
@@ -648,6 +690,12 @@ fn read_short_hostname() -> Option<String> {
     } else {
         Some(short)
     }
+}
+
+fn get_session_cost(root: &Value) -> Option<f64> {
+    get_object(root, "cost")
+        .and_then(|cost| get_number(cost, "total_cost_usd"))
+        .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 fn get_workspace_worktree(root: &Value) -> Option<String> {
@@ -1430,6 +1478,8 @@ mod tests {
             ("identity → directory".to_string(), IDENTITY_BACKGROUND, DIRECTORY_BACKGROUND),
             ("directory → model".to_string(), DIRECTORY_BACKGROUND, MODEL_BACKGROUND),
             ("model → effort".to_string(), MODEL_BACKGROUND, EFFORT_BACKGROUND),
+            ("cost → git".to_string(), COST_BACKGROUND, GIT_BACKGROUND),
+            ("cost → diff".to_string(), COST_BACKGROUND, DIFF_BACKGROUND),
             ("git → worktree".to_string(), GIT_BACKGROUND, WORKTREE_BACKGROUND),
             ("git → diff".to_string(), GIT_BACKGROUND, DIFF_BACKGROUND),
             ("worktree → diff".to_string(), WORKTREE_BACKGROUND, DIFF_BACKGROUND),
@@ -1449,7 +1499,9 @@ mod tests {
         }
 
         for (index, light) in RATE_LIGHT_BANDS.into_iter().enumerate() {
+            // コストは入力に含まれないことがあるので、7d の次はどちらもありうる。
             pairs.push((format!("7d[{index}] → git"), light, GIT_BACKGROUND));
+            pairs.push((format!("7d[{index}] → cost"), light, COST_BACKGROUND));
         }
 
         pairs
@@ -1481,6 +1533,7 @@ mod tests {
             ("git", GIT_BACKGROUND, WHITE),
             ("worktree", WORKTREE_BACKGROUND, WHITE),
             ("diff", DIFF_BACKGROUND, DARK_TEXT),
+            ("cost", COST_BACKGROUND, DARK_TEXT),
         ];
         for context in CONTEXT_BANDS {
             pairs.push(("context", context, DARK_TEXT));
@@ -1502,8 +1555,8 @@ mod tests {
     /// 一致していること。区切りは「5段ぶん＋ゲージを閉じるぶん」で6個になる。
     #[test]
     fn effort_gauge_always_shows_five_steps() {
-        for step in 1..=EFFORT_STEPS {
-            let gauge = build_effort_gauge(step);
+        for (step, phase) in (1..=EFFORT_STEPS).flat_map(|s| (0..EFFORT_PHASES).map(move |p| (s, p))) {
+            let gauge = build_effort_gauge(step, phase);
 
             let separators = gauge.matches(POWERLINE_RIGHT).count()
                 + gauge.matches(POWERLINE_RIGHT_THIN).count();
@@ -1516,9 +1569,9 @@ mod tests {
                 "step {step}: 未点灯セルの数"
             );
 
-            for (index, filled) in EFFORT_FILLED_BACKGROUNDS.into_iter().enumerate() {
+            for (index, filled) in EFFORT_FILLED_ANIMATION[phase].into_iter().enumerate() {
                 let present = gauge.contains(&background(filled));
-                assert_eq!(present, index < step, "step {step}: 段 {index} の点灯状態");
+                assert_eq!(present, index < step, "step {step} phase {phase}: 段 {index} の点灯状態");
             }
 
             let empty_expected = step < EFFORT_STEPS;
@@ -1541,7 +1594,9 @@ mod tests {
             foreground(WHITE)
         );
         for step in 1..=EFFORT_STEPS {
-            assert!(build_effort_gauge(step).ends_with(&tail), "step {step}");
+            for phase in 0..EFFORT_PHASES {
+                assert!(build_effort_gauge(step, phase).ends_with(&tail), "step {step} phase {phase}");
+            }
         }
     }
 
@@ -1549,26 +1604,29 @@ mod tests {
     /// 水位（塗り→未点灯）は一目で分からなければならない。
     #[test]
     fn effort_gauge_steps_are_distinguishable() {
-        for index in 0..EFFORT_STEPS - 1 {
-            let difference = delta_e(
-                EFFORT_FILLED_BACKGROUNDS[index],
-                EFFORT_FILLED_BACKGROUNDS[index + 1],
-            );
-            assert!(difference >= 8.0, "塗り{index}→{}: 色差 {difference:.1}", index + 1);
-        }
+        for (phase, steps) in EFFORT_FILLED_ANIMATION.into_iter().enumerate() {
+            for index in 0..EFFORT_STEPS - 1 {
+                let difference = delta_e(steps[index], steps[index + 1]);
+                assert!(
+                    difference >= 8.0,
+                    "phase {phase} 塗り{index}→{}: 色差 {difference:.1}",
+                    index + 1
+                );
+            }
 
-        for (index, filled) in EFFORT_FILLED_BACKGROUNDS.into_iter().enumerate() {
-            let difference = delta_e(filled, EFFORT_EMPTY_BACKGROUND);
-            assert!(difference >= 20.0, "塗り{index}→未点灯: 色差 {difference:.1}");
-        }
+            for (index, filled) in steps.into_iter().enumerate() {
+                let difference = delta_e(filled, EFFORT_EMPTY_BACKGROUND);
+                assert!(difference >= 20.0, "phase {phase} 塗り{index}→未点灯: 色差 {difference:.1}");
+            }
 
-        for (label, first, second) in [
-            ("背景→塗り1", EFFORT_BACKGROUND, EFFORT_FILLED_BACKGROUNDS[0]),
-            ("未点灯→背景", EFFORT_EMPTY_BACKGROUND, EFFORT_BACKGROUND),
-            ("塗り5→背景", EFFORT_FILLED_BACKGROUNDS[EFFORT_STEPS - 1], EFFORT_BACKGROUND),
-        ] {
-            let difference = delta_e(first, second);
-            assert!(difference >= 8.0, "{label}: 色差 {difference:.1}");
+            for (label, first, second) in [
+                ("背景→塗り1", EFFORT_BACKGROUND, steps[0]),
+                ("未点灯→背景", EFFORT_EMPTY_BACKGROUND, EFFORT_BACKGROUND),
+                ("塗り5→背景", steps[EFFORT_STEPS - 1], EFFORT_BACKGROUND),
+            ] {
+                let difference = delta_e(first, second);
+                assert!(difference >= 8.0, "phase {phase} {label}: 色差 {difference:.1}");
+            }
         }
 
         // 未点灯どうしは同色なので、細区切りだけが段の切れ目を示す。
@@ -1583,22 +1641,87 @@ mod tests {
     /// 決まる。色差だけ大きくても、暗い色どうしでは点灯しているように見えない。
     #[test]
     fn effort_gauge_lit_steps_stand_out_from_unlit() {
-        for (index, filled) in EFFORT_FILLED_BACKGROUNDS.into_iter().enumerate() {
-            let ratio = contrast_ratio(filled, EFFORT_EMPTY_BACKGROUND);
-            assert!(
-                ratio >= 3.5,
-                "段 {index}: 未点灯とのコントラスト比 {ratio:.2} では点灯が読み取れない"
-            );
+        for (phase, steps) in EFFORT_FILLED_ANIMATION.into_iter().enumerate() {
+            for (index, filled) in steps.into_iter().enumerate() {
+                let ratio = contrast_ratio(filled, EFFORT_EMPTY_BACKGROUND);
+                assert!(
+                    ratio >= 3.5,
+                    "phase {phase} 段 {index}: 未点灯とのコントラスト比 {ratio:.2}"
+                );
+            }
         }
     }
 
     /// 塗り色は位置が上がるほど明るくなること（Effort が高いほど強く見せる）。
     #[test]
     fn effort_gauge_brightens_with_each_step() {
-        for index in 0..EFFORT_STEPS - 1 {
-            let lower = relative_luminance(EFFORT_FILLED_BACKGROUNDS[index]);
-            let higher = relative_luminance(EFFORT_FILLED_BACKGROUNDS[index + 1]);
-            assert!(higher > lower, "段 {index} より次の段が明るくない");
+        for (phase, steps) in EFFORT_FILLED_ANIMATION.into_iter().enumerate() {
+            for index in 0..EFFORT_STEPS - 1 {
+                let lower = relative_luminance(steps[index]);
+                let higher = relative_luminance(steps[index + 1]);
+                assert!(higher > lower, "phase {phase}: 段 {index} より次の段が明るくない");
+            }
+        }
+    }
+
+    /// アニメーションは明度ではなく色相だけを動かす。明度が動くと点灯・未点灯の
+    /// 見分けが位相によってぶれてしまう。
+    #[test]
+    fn effort_animation_holds_each_step_luminance_steady() {
+        for index in 0..EFFORT_STEPS {
+            let values: Vec<f64> = EFFORT_FILLED_ANIMATION
+                .iter()
+                .map(|steps| relative_luminance(steps[index]))
+                .collect();
+            let highest = values.iter().cloned().fold(f64::MIN, f64::max);
+            let lowest = values.iter().cloned().fold(f64::MAX, f64::min);
+            assert!(
+                highest / lowest <= 1.05,
+                "段 {index}: 位相で輝度が {:.3} 倍動いている",
+                highest / lowest
+            );
+        }
+    }
+
+    /// 再描画は毎秒1回が上限なので、1フレームの変化が大きいとちらついて見え、
+    /// 小さすぎると止まって見える。連続する位相の色差を両側から挟む。
+    #[test]
+    fn effort_animation_advances_smoothly() {
+        let mut largest: f64 = 0.0;
+        for (phase, steps) in EFFORT_FILLED_ANIMATION.into_iter().enumerate() {
+            let next = EFFORT_FILLED_ANIMATION[(phase + 1) % EFFORT_PHASES];
+            for (index, color) in steps.into_iter().enumerate() {
+                let difference = delta_e(color, next[index]);
+                assert!(
+                    difference <= 5.0,
+                    "phase {phase} 段 {index}: 1フレームの色差 {difference:.1} はちらつく"
+                );
+                largest = largest.max(difference);
+            }
+        }
+
+        assert!(largest >= 2.0, "1フレームの色差が最大 {largest:.1} では動いて見えない");
+    }
+
+    /// 全段が同じ位相で動くこと。段ごとにずらすと瞬間の色相幅が広がり、
+    /// 「5段が別々の色」に見えてしまう。
+    #[test]
+    fn effort_animation_keeps_one_hue_family() {
+        for (phase, steps) in EFFORT_FILLED_ANIMATION.into_iter().enumerate() {
+            let hues: Vec<f64> = steps
+                .into_iter()
+                .map(|color| {
+                    let (_, a, b) = to_lab(color);
+                    b.atan2(a).to_degrees()
+                })
+                .collect();
+            let highest = hues.iter().cloned().fold(f64::MIN, f64::max);
+            let lowest = hues.iter().cloned().fold(f64::MAX, f64::min);
+            assert!(
+                highest - lowest <= 12.0,
+                "phase {phase}: 瞬間の色相幅 {:.1} 度",
+                highest - lowest
+            );
         }
     }
 
