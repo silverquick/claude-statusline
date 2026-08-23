@@ -103,6 +103,8 @@ const EFFORT_PENDING_BACKGROUNDS: [Color; EFFORT_STEPS] = [
 // 満ちきったあと次の周回まで留まるコマ数。再描画は毎秒1回が上限なので、
 // これがそのまま「止まって見える秒数」になる。
 const EFFORT_HOLD_FRAMES: usize = 4;
+// 端末の地の上へ描くときのゲージの表示幅。段5つと、段間4つ＋末尾1つの区切り。
+const EFFORT_GAUGE_WIDTH: usize = EFFORT_STEPS * 2;
 const EFFORT_EMPTY_BACKGROUND: Color = rgb(35, 29, 41);
 // 未点灯セルには使用率バーと同じ `░` を置く。色だけに頼らない手がかりを
 // 足すことで、点灯との違いと段数の両方が読み取れるようにする。
@@ -305,7 +307,7 @@ fn get_main_effort(root: &Value) -> String {
 /// 未知の値や `--` のときは、置く位置が決められないのでゲージを出さない。
 fn create_effort_text(label: &str) -> String {
     match get_effort_step(label) {
-        Some(step) => format!(" {} {} ", label, build_effort_gauge(step, current_phase())),
+        Some(step) => format!(" {} {} ", label, build_effort_gauge(step, current_phase(), Some(EFFORT_BACKGROUND))),
         None => format!(" {} ", label),
     }
 }
@@ -337,14 +339,18 @@ fn get_effort_step(label: &str) -> Option<usize> {
 /// 5段を斜めの境界でつないだゲージ。各段は「区切り＋1マスの地」でできており、
 /// 区切りの前景に前の段の色、背景に次の段の色を置くことで台形が連続して見える。
 /// 最後にセグメント本来の色へ戻すので、外側の Powerline 接続には影響しない。
-fn build_effort_gauge(step: usize, phase: usize) -> String {
+/// 5段ゲージを組み立てる。`surround` はゲージの外側の背景色で、Powerline
+/// セグメントの中に描くときはその背景色を渡す。サブエージェント行のように
+/// 端末の地の上へ直接描くときは `None` を渡す。外側の色が分からないと
+/// ゲージ先頭の楔は描けないので、その場合は最初の段から始める。
+fn build_effort_gauge(step: usize, phase: usize, surround: Option<Color>) -> String {
     // 1コマ目は何も点いていない状態から始め、1段ずつ点けていき、現在の段階に
     // 達したらしばらくそのまま留まる。段階より上の段には決して届かない。
     let cycle = step + 1 + EFFORT_HOLD_FRAMES;
     let lit = (phase % cycle).min(step);
 
     let mut gauge = String::new();
-    let mut previous = EFFORT_BACKGROUND;
+    let mut previous = surround;
 
     for index in 0..EFFORT_STEPS {
         let current = if index < lit {
@@ -355,15 +361,19 @@ fn build_effort_gauge(step: usize, phase: usize) -> String {
             EFFORT_EMPTY_BACKGROUND
         };
 
-        if current == previous {
+        match previous {
             // 未点灯どうしは背景が同一で、実線の楔は原理的に描けない。
             // 5段あることが分かるよう、細い区切りで段の切れ目だけを示す。
-            gauge.push_str(&foreground(EFFORT_EMPTY_DIVIDER));
-            gauge.push(POWERLINE_RIGHT_THIN);
-        } else {
-            gauge.push_str(&foreground(previous));
-            gauge.push_str(&background(current));
-            gauge.push(POWERLINE_RIGHT);
+            Some(prev) if prev == current => {
+                gauge.push_str(&foreground(EFFORT_EMPTY_DIVIDER));
+                gauge.push(POWERLINE_RIGHT_THIN);
+            }
+            Some(prev) => {
+                gauge.push_str(&foreground(prev));
+                gauge.push_str(&background(current));
+                gauge.push(POWERLINE_RIGHT);
+            }
+            None => gauge.push_str(&background(current)),
         }
 
         if index < step {
@@ -373,13 +383,26 @@ fn build_effort_gauge(step: usize, phase: usize) -> String {
             gauge.push('\u{2591}');
         }
 
-        previous = current;
+        previous = Some(current);
     }
 
-    gauge.push_str(&foreground(previous));
-    gauge.push_str(&background(EFFORT_BACKGROUND));
-    gauge.push(POWERLINE_RIGHT);
-    gauge.push_str(&foreground(WHITE));
+    let last = previous.unwrap_or(EFFORT_EMPTY_BACKGROUND);
+    gauge.push_str(&foreground(last));
+    match surround {
+        Some(color) => {
+            gauge.push_str(&background(color));
+            gauge.push(POWERLINE_RIGHT);
+            gauge.push_str(&foreground(WHITE));
+        }
+        None => {
+            // 端末の地へ戻してから閉じ、装飾を残さないよう完全にリセットする。
+            gauge.push_str(ESCAPE);
+            gauge.push_str("49m");
+            gauge.push(POWERLINE_RIGHT);
+            gauge.push_str(ESCAPE);
+            gauge.push_str("0m");
+        }
+    }
     gauge
 }
 
@@ -1232,6 +1255,12 @@ fn build_subagent_content(task: &Value, session_effort: Option<&str>, columns: O
 
     if let Some(effort) = get_task_effort(task, session_effort) {
         colored.push(ansi("35", &effort));
+        // 段階が既知のときだけゲージを添える。サブエージェントの effort は
+        // 数値のトークン予算でもありうるので、その場合は数値のまま出す。
+        if let Some(step) = get_effort_step(&effort) {
+            colored.push(build_effort_gauge(step, current_phase(), None));
+            plain.push(" ".repeat(EFFORT_GAUGE_WIDTH));
+        }
         plain.push(effort);
     }
 
@@ -1563,7 +1592,7 @@ mod tests {
     fn effort_gauge_always_shows_five_steps() {
         for step in 1..=EFFORT_STEPS {
             for phase in 0..step + 1 + EFFORT_HOLD_FRAMES {
-                let gauge = build_effort_gauge(step, phase);
+                let gauge = build_effort_gauge(step, phase, Some(EFFORT_BACKGROUND));
 
                 let separators = gauge.matches(POWERLINE_RIGHT).count()
                     + gauge.matches(POWERLINE_RIGHT_THIN).count();
@@ -1591,7 +1620,7 @@ mod tests {
             let cycle = step + 1 + EFFORT_HOLD_FRAMES;
             let lit_counts: Vec<usize> = (0..cycle)
                 .map(|phase| {
-                    let gauge = build_effort_gauge(step, phase);
+                    let gauge = build_effort_gauge(step, phase, Some(EFFORT_BACKGROUND));
                     EFFORT_LIT_BACKGROUNDS
                         .into_iter()
                         .filter(|color| gauge.contains(&background(*color)))
@@ -1610,7 +1639,7 @@ mod tests {
 
             // 段階より上の段は、どのコマでも点灯色にならない。
             for phase in 0..cycle * 3 {
-                let gauge = build_effort_gauge(step, phase);
+                let gauge = build_effort_gauge(step, phase, Some(EFFORT_BACKGROUND));
                 for (above, color) in EFFORT_LIT_BACKGROUNDS.into_iter().enumerate().skip(step) {
                     assert!(
                         !gauge.contains(&background(color)),
@@ -1634,7 +1663,7 @@ mod tests {
         for step in 1..=EFFORT_STEPS {
             for phase in 0..step + 1 + EFFORT_HOLD_FRAMES {
                 assert!(
-                    build_effort_gauge(step, phase).ends_with(&tail),
+                    build_effort_gauge(step, phase, Some(EFFORT_BACKGROUND)).ends_with(&tail),
                     "step {step} phase {phase}"
                 );
             }
@@ -1726,6 +1755,54 @@ mod tests {
                 assert!(higher > lower, "{label}: 段 {index} より次の段が明るくない");
             }
         }
+    }
+
+    /// サブエージェント行は Powerline セグメントの中ではなく端末の地の上に
+    /// 描く。外側の背景色が分からないので先頭の楔は描かず、幅は段5つ＋区切り
+    /// 5つの10桁になる。説明文の切り詰め計算がこの幅に依存している。
+    #[test]
+    fn effort_gauge_on_terminal_ground_has_a_known_width() {
+        for step in 1..=EFFORT_STEPS {
+            for phase in 0..step + 1 + EFFORT_HOLD_FRAMES {
+                let gauge = build_effort_gauge(step, phase, None);
+
+                let separators = gauge.matches(POWERLINE_RIGHT).count()
+                    + gauge.matches(POWERLINE_RIGHT_THIN).count();
+                let bodies = gauge.matches(' ').count() + gauge.matches('\u{2591}').count();
+                assert_eq!(bodies, EFFORT_STEPS, "step {step} phase {phase}: 段の数");
+                assert_eq!(
+                    separators + bodies,
+                    EFFORT_GAUGE_WIDTH,
+                    "step {step} phase {phase}: 表示幅"
+                );
+
+                // 装飾を残したまま行の続きへ抜けると、後ろの文字まで着色される。
+                assert!(
+                    gauge.ends_with(&format!("{ESCAPE}0m")),
+                    "step {step} phase {phase}: 末尾でリセットしていない"
+                );
+            }
+        }
+    }
+
+    /// サブエージェントの effort は数値のトークン予算のこともある。段階に
+    /// 落とし込めないので、その場合はゲージを出さず数値のまま見せる。
+    #[test]
+    fn subagent_rows_show_the_gauge_only_for_named_levels() {
+        let named = serde_json::json!({
+            "id": "a", "model": "claude-opus-5", "effort": "high",
+            "tokenCount": 45231, "contextWindowSize": 200000
+        });
+        let content = build_subagent_content(&named, None, Some(120)).expect("行が出ない");
+        assert!(content.contains(POWERLINE_RIGHT), "既知の段階にゲージが出ていない");
+
+        let budget = serde_json::json!({
+            "id": "b", "model": "claude-opus-5", "effort": 12000,
+            "tokenCount": 8000, "contextWindowSize": 200000
+        });
+        let content = build_subagent_content(&budget, None, Some(120)).expect("行が出ない");
+        assert!(!content.contains(POWERLINE_RIGHT), "数値予算にゲージが出ている");
+        assert!(content.contains("12k"), "数値予算が出ていない");
     }
 
     /// 既知の5段階だけがゲージを持ち、未知の値や `--` では出さないこと。
