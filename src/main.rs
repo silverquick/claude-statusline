@@ -15,9 +15,13 @@ use chrono::{DateTime, Datelike, Local, TimeZone, Timelike, Utc};
 use serde_json::Value;
 
 const ESCAPE: &str = "\x1b[";
-// 区切りは常に実線。前のセグメントの背景色で描かれるので、隣り合う背景が
-// 知覚的に十分離れている必要がある。この条件は tests で機械的に検証している。
+// セグメント間の区切りは常に実線。前のセグメントの背景色で描かれるので、
+// 隣り合う背景が知覚的に十分離れている必要がある。この条件は tests で
+// 機械的に検証している。
 const POWERLINE_RIGHT: char = '\u{e0b0}';
+// 細い区切りは、両側の背景色が文字どおり同一で実線の楔が原理的に描けない
+// 箇所にだけ使う。Effort ゲージの未点灯どうしがこれにあたる。
+const POWERLINE_RIGHT_THIN: char = '\u{e0b1}';
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -59,6 +63,21 @@ const DARK_TEXT: Color = rgb(30, 36, 45);
 // トラックを挟むことで、どのセグメントでもコントラスト比 4.2 以上を保証する。
 const BAR_TRACK_BACKGROUND: Color = rgb(26, 30, 38);
 const BAR_EMPTY_FOREGROUND: Color = rgb(78, 86, 102);
+
+// Effort は連続値ではなく5段階なので、割合を示すバーではなく段の数を示す
+// ゲージで描く。塗り色は Effort セグメントと同じ紫系で、位置が上がるほど
+// 明るくなる。これにより Effort が高いほどゲージ全体が明るく見える。
+// 5色を別々の色相にはせず、あくまで1本のランプとして読ませる。
+const EFFORT_STEPS: usize = 5;
+const EFFORT_FILLED_BACKGROUNDS: [Color; EFFORT_STEPS] = [
+    rgb(106, 62, 158),
+    rgb(128, 85, 184),
+    rgb(150, 109, 208),
+    rgb(172, 134, 226),
+    rgb(196, 162, 242),
+];
+const EFFORT_EMPTY_BACKGROUND: Color = rgb(53, 40, 74);
+const EFFORT_EMPTY_DIVIDER: Color = rgb(120, 100, 145);
 
 struct Segment {
     background: Color,
@@ -162,7 +181,7 @@ fn build_status_line(root: &Value) -> String {
         Segment {
             background: EFFORT_BACKGROUND,
             foreground: WHITE,
-            text: format!(" {} ", get_main_effort(root)),
+            text: create_effort_text(&get_main_effort(root)),
         },
         Segment {
             background: context_background,
@@ -239,6 +258,62 @@ fn get_main_effort(root: &Value) -> String {
     } else {
         capitalize(&cleaned)
     }
+}
+
+/// Effort の表示。既知の5段階なら見出しのあとに段数ゲージを添える。
+/// 未知の値や `--` のときは、置く位置が決められないのでゲージを出さない。
+fn create_effort_text(label: &str) -> String {
+    match get_effort_step(label) {
+        Some(step) => format!(" {} {} ", label, build_effort_gauge(step)),
+        None => format!(" {} ", label),
+    }
+}
+
+fn get_effort_step(label: &str) -> Option<usize> {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "minimal" => Some(1),
+        "low" => Some(2),
+        "medium" => Some(3),
+        "high" => Some(4),
+        "xhigh" => Some(5),
+        _ => None,
+    }
+}
+
+/// 5段を斜めの境界でつないだゲージ。各段は「区切り＋1マスの地」でできており、
+/// 区切りの前景に前の段の色、背景に次の段の色を置くことで台形が連続して見える。
+/// 最後にセグメント本来の色へ戻すので、外側の Powerline 接続には影響しない。
+fn build_effort_gauge(step: usize) -> String {
+    let mut gauge = String::new();
+    let mut previous = EFFORT_BACKGROUND;
+
+    for (index, filled) in EFFORT_FILLED_BACKGROUNDS.into_iter().enumerate() {
+        let current = if index < step {
+            filled
+        } else {
+            EFFORT_EMPTY_BACKGROUND
+        };
+
+        if current == previous {
+            // 未点灯どうしは背景が同一で、実線の楔は原理的に描けない。
+            // 5段あることが分かるよう、細い区切りで段の切れ目だけを示す。
+            gauge.push_str(&foreground(EFFORT_EMPTY_DIVIDER));
+            gauge.push(POWERLINE_RIGHT_THIN);
+        } else {
+            gauge.push_str(&foreground(previous));
+            gauge.push_str(&background(current));
+            gauge.push(POWERLINE_RIGHT);
+        }
+
+        gauge.push(' ');
+        previous = current;
+    }
+
+    gauge.push_str(&foreground(previous));
+    gauge.push_str(&background(EFFORT_BACKGROUND));
+    gauge.push(POWERLINE_RIGHT);
+    gauge.push_str(&foreground(WHITE));
+    gauge
 }
 
 fn create_context_text(context: &Context, foreground: Color, background: Color) -> String {
@@ -1402,6 +1477,111 @@ mod tests {
             let ratio = contrast_ratio(background, text);
             assert!(ratio >= 4.5, "{label}: コントラスト比 {ratio:.2} は AA 未満");
         }
+    }
+
+    /// Effort は5段階なので、どの段階でも必ず5段が描かれ、点灯数が段階と
+    /// 一致していること。区切りは「5段ぶん＋ゲージを閉じるぶん」で6個になる。
+    #[test]
+    fn effort_gauge_always_shows_five_steps() {
+        for step in 1..=EFFORT_STEPS {
+            let gauge = build_effort_gauge(step);
+
+            let separators = gauge.matches(POWERLINE_RIGHT).count()
+                + gauge.matches(POWERLINE_RIGHT_THIN).count();
+            assert_eq!(separators, EFFORT_STEPS + 1, "step {step}: 区切りの数");
+
+            let bodies = gauge.matches(' ').count();
+            assert_eq!(bodies, EFFORT_STEPS, "step {step}: 段の数");
+
+            for (index, filled) in EFFORT_FILLED_BACKGROUNDS.into_iter().enumerate() {
+                let present = gauge.contains(&background(filled));
+                assert_eq!(present, index < step, "step {step}: 段 {index} の点灯状態");
+            }
+
+            let empty_expected = step < EFFORT_STEPS;
+            assert_eq!(
+                gauge.contains(&background(EFFORT_EMPTY_BACKGROUND)),
+                empty_expected,
+                "step {step}: 未点灯の有無"
+            );
+        }
+    }
+
+    /// ゲージはセグメント本来の色へ戻して終わること。戻し忘れると外側の
+    /// Powerline 接続の色がずれる。
+    #[test]
+    fn effort_gauge_restores_segment_colours() {
+        let tail = format!(
+            "{}{}{}",
+            background(EFFORT_BACKGROUND),
+            POWERLINE_RIGHT,
+            foreground(WHITE)
+        );
+        for step in 1..=EFFORT_STEPS {
+            assert!(build_effort_gauge(step).ends_with(&tail), "step {step}");
+        }
+    }
+
+    /// 段の境界が見えること。塗り同士はランプとして読ませたいので控えめでよいが、
+    /// 水位（塗り→未点灯）は一目で分からなければならない。
+    #[test]
+    fn effort_gauge_steps_are_distinguishable() {
+        for index in 0..EFFORT_STEPS - 1 {
+            let difference = delta_e(
+                EFFORT_FILLED_BACKGROUNDS[index],
+                EFFORT_FILLED_BACKGROUNDS[index + 1],
+            );
+            assert!(difference >= 8.0, "塗り{index}→{}: 色差 {difference:.1}", index + 1);
+        }
+
+        for (index, filled) in EFFORT_FILLED_BACKGROUNDS.into_iter().enumerate() {
+            let difference = delta_e(filled, EFFORT_EMPTY_BACKGROUND);
+            assert!(difference >= 20.0, "塗り{index}→未点灯: 色差 {difference:.1}");
+        }
+
+        for (label, first, second) in [
+            ("背景→塗り1", EFFORT_BACKGROUND, EFFORT_FILLED_BACKGROUNDS[0]),
+            ("未点灯→背景", EFFORT_EMPTY_BACKGROUND, EFFORT_BACKGROUND),
+            ("塗り5→背景", EFFORT_FILLED_BACKGROUNDS[EFFORT_STEPS - 1], EFFORT_BACKGROUND),
+        ] {
+            let difference = delta_e(first, second);
+            assert!(difference >= 8.0, "{label}: 色差 {difference:.1}");
+        }
+
+        // 未点灯どうしは同色なので、細区切りだけが段の切れ目を示す。
+        let divider = contrast_ratio(EFFORT_EMPTY_DIVIDER, EFFORT_EMPTY_BACKGROUND);
+        assert!(divider >= 2.0, "細区切りのコントラスト比 {divider:.2}");
+    }
+
+    /// 塗り色は位置が上がるほど明るくなること（Effort が高いほど強く見せる）。
+    #[test]
+    fn effort_gauge_brightens_with_each_step() {
+        for index in 0..EFFORT_STEPS - 1 {
+            let lower = relative_luminance(EFFORT_FILLED_BACKGROUNDS[index]);
+            let higher = relative_luminance(EFFORT_FILLED_BACKGROUNDS[index + 1]);
+            assert!(higher > lower, "段 {index} より次の段が明るくない");
+        }
+    }
+
+    /// 既知の5段階だけがゲージを持ち、未知の値や `--` では出さないこと。
+    #[test]
+    fn effort_gauge_only_applies_to_known_levels() {
+        for (label, expected) in [
+            ("Minimal", Some(1)),
+            ("Low", Some(2)),
+            ("Medium", Some(3)),
+            ("High", Some(4)),
+            ("Xhigh", Some(5)),
+            ("XHIGH", Some(5)),
+            ("--", None),
+            ("Turbo", None),
+        ] {
+            assert_eq!(get_effort_step(label), expected, "{label}");
+        }
+
+        let unknown = create_effort_text("Turbo");
+        assert!(!unknown.contains(POWERLINE_RIGHT), "未知の値にゲージが出ている");
+        assert_eq!(unknown, " Turbo ");
     }
 
     /// バーは専用のトラックの上に描くので、グラデーションの全域でトラックと
