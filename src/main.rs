@@ -944,8 +944,17 @@ fn format_reset(reset: Option<DateTime<Utc>>) -> String {
 
     let local = reset.with_timezone(&Local);
     let remaining = local.signed_duration_since(Local::now());
+
+    // すでに過ぎている場合、残り時間のカウントダウンは意味を持たない。しかし
+    // ここで何も出さないと、上限に達して利用率の更新が止まったときに、ちょうど
+    // リセット時刻まで消えてしまう。一番知りたいときに何も分からなくなるので、
+    // 時刻そのものは残し、カウントダウンの代わりに `--` を置いて古い値だと示す。
     if remaining <= chrono::Duration::zero() {
-        return String::new();
+        return if -remaining < chrono::Duration::days(1) {
+            format!(" {:02}:{:02}(--)", local.hour(), local.minute())
+        } else {
+            format!(" {}/{}(--)", local.month(), local.day())
+        };
     }
 
     if remaining < chrono::Duration::days(1) {
@@ -1885,6 +1894,29 @@ mod tests {
         let unknown = create_effort_text("Turbo");
         assert!(!unknown.contains(POWERLINE_RIGHT), "未知の値にゲージが出ている");
         assert_eq!(unknown, " Turbo ");
+    }
+
+    /// リセット時刻が過ぎていても表示を消さないこと。5時間の窓は5時間ごとに
+    /// 切り替わるため、上限に達して利用率の更新が止まるとすぐ過去になる。
+    /// そこで消えてしまうと、一番知りたいときに何も分からなくなる。
+    #[test]
+    fn reset_time_survives_once_it_has_passed() {
+        let now = Local::now().with_timezone(&Utc);
+
+        // 秒単位の経過で分が繰り下がるため、桁ではなく形だけを確かめる。
+        let future = format_reset(Some(now + chrono::Duration::minutes(205)));
+        assert!(future.contains('h') && future.contains('m'), "未来のカウントダウン: {future:?}");
+        assert!(!future.ends_with("(--)"), "未来なのに古い値の印がある: {future:?}");
+
+        let just_passed = format_reset(Some(now - chrono::Duration::hours(2)));
+        assert!(!just_passed.is_empty(), "過ぎた直後に表示が消えている");
+        assert!(just_passed.ends_with("(--)"), "古い値の印がない: {just_passed:?}");
+
+        let long_passed = format_reset(Some(now - chrono::Duration::hours(30)));
+        assert!(long_passed.ends_with("(--)"), "{long_passed:?}");
+        assert!(long_passed.contains('/'), "1日以上前は日付で示す: {long_passed:?}");
+
+        assert_eq!(format_reset(None), "", "値がなければ何も出さない");
     }
 
     /// バーは専用のトラックの上に描くので、グラデーションの全域でトラックと
