@@ -15,12 +15,9 @@ use chrono::{DateTime, Datelike, Local, TimeZone, Timelike, Utc};
 use serde_json::Value;
 
 const ESCAPE: &str = "\x1b[";
+// 区切りは常に実線。前のセグメントの背景色で描かれるので、隣り合う背景が
+// 知覚的に十分離れている必要がある。この条件は tests で機械的に検証している。
 const POWERLINE_RIGHT: char = '\u{e0b0}';
-// 隣接するセグメントの背景色が近いと実線の区切りは前の背景色で描かれるため消えてしまう。
-// その場合は細い区切りを文字色で描いて、境界を必ず見えるようにする。
-const POWERLINE_RIGHT_THIN: char = '\u{e0b1}';
-const SEPARATOR_MIN_CONTRAST: f64 = 1.6;
-const SEPARATOR_BLEND: f64 = 0.5;
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1015,24 +1012,9 @@ fn render_powerline(segments: &[Segment]) -> String {
         if index == 0 {
             output.push_str(&background(segment.background));
         } else {
-            let previous = segments[index - 1].background;
-            if contrast_ratio(previous, segment.background) < SEPARATOR_MIN_CONTRAST {
-                // 実線の区切りは前のセグメントの背景色で描かれる。両者が近いと
-                // 境界が消えるため、細い区切りに切り替える。ここで文字色をそのまま
-                // 使うと実線の楔より目立ち、左右で見た目が揃わなくなるので、
-                // 地の色と文字色の中間で控えめに描く。
-                output.push_str(&background(segment.background));
-                output.push_str(&foreground(blend(
-                    segment.background,
-                    segment.foreground,
-                    SEPARATOR_BLEND,
-                )));
-                output.push(POWERLINE_RIGHT_THIN);
-            } else {
-                output.push_str(&foreground(previous));
-                output.push_str(&background(segment.background));
-                output.push(POWERLINE_RIGHT);
-            }
+            output.push_str(&foreground(segments[index - 1].background));
+            output.push_str(&background(segment.background));
+            output.push(POWERLINE_RIGHT);
         }
 
         output.push_str(&foreground(segment.foreground));
@@ -1047,46 +1029,6 @@ fn render_powerline(segments: &[Segment]) -> String {
     output.push_str(ESCAPE);
     output.push_str("0m");
     output
-}
-
-/// 2色を `ratio` の割合で混ぜる。0.0 で `from`、1.0 で `to` になる。
-fn blend(from: Color, to: Color, ratio: f64) -> Color {
-    let ratio = ratio.clamp(0.0, 1.0);
-    let channel = |from: i32, to: i32| {
-        (f64::from(from) + (f64::from(to) - f64::from(from)) * ratio).round() as i32
-    };
-
-    rgb(
-        channel(from.red, to.red),
-        channel(from.green, to.green),
-        channel(from.blue, to.blue),
-    )
-}
-
-/// WCAG 2.x の相対輝度。
-fn relative_luminance(color: Color) -> f64 {
-    fn channel(value: i32) -> f64 {
-        let value = f64::from(value.clamp(0, 255)) / 255.0;
-        if value <= 0.03928 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        }
-    }
-
-    0.2126 * channel(color.red) + 0.7152 * channel(color.green) + 0.0722 * channel(color.blue)
-}
-
-/// WCAG 2.x のコントラスト比。1.0（同色）から 21.0（黒と白）の範囲を取る。
-fn contrast_ratio(first: Color, second: Color) -> f64 {
-    let (first, second) = (relative_luminance(first), relative_luminance(second));
-    let (higher, lower) = if first >= second {
-        (first, second)
-    } else {
-        (second, first)
-    };
-
-    (higher + 0.05) / (lower + 0.05)
 }
 
 fn foreground(color: Color) -> String {
@@ -1308,4 +1250,173 @@ fn get_string<'a>(element: &'a Value, property_name: &str) -> Option<&'a str> {
 
 fn get_number(element: &Value, property_name: &str) -> Option<f64> {
     element.as_object()?.get(property_name)?.as_f64()
+}
+
+// ---------------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONTEXT_BANDS: [Color; 4] = [
+        CONTEXT_LOW_BACKGROUND,
+        CONTEXT_MEDIUM_BACKGROUND,
+        CONTEXT_HIGH_BACKGROUND,
+        CONTEXT_CRITICAL_BACKGROUND,
+    ];
+    const RATE_DARK_BANDS: [Color; 3] = [
+        RATE_DARK_LOW_BACKGROUND,
+        RATE_DARK_MEDIUM_BACKGROUND,
+        RATE_DARK_HIGH_BACKGROUND,
+    ];
+    const RATE_LIGHT_BANDS: [Color; 3] = [
+        RATE_LIGHT_LOW_BACKGROUND,
+        RATE_LIGHT_MEDIUM_BACKGROUND,
+        RATE_LIGHT_HIGH_BACKGROUND,
+    ];
+
+    fn to_linear(channel: i32) -> f64 {
+        let channel = f64::from(channel.clamp(0, 255)) / 255.0;
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// sRGB を CIE L*a*b*（D65）へ変換する。
+    fn to_lab(color: Color) -> (f64, f64, f64) {
+        let (red, green, blue) = (
+            to_linear(color.red),
+            to_linear(color.green),
+            to_linear(color.blue),
+        );
+        let x = (red * 0.4124564 + green * 0.3575761 + blue * 0.1804375) / 0.95047;
+        let y = red * 0.2126729 + green * 0.7151522 + blue * 0.0721750;
+        let z = (red * 0.0193339 + green * 0.1191920 + blue * 0.9503041) / 1.08883;
+
+        let f = |t: f64| {
+            if t > 216.0 / 24389.0 {
+                t.cbrt()
+            } else {
+                (841.0 / 108.0) * t + 4.0 / 29.0
+            }
+        };
+        let (fx, fy, fz) = (f(x), f(y), f(z));
+        (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+    }
+
+    /// CIE76 の色差。2.3 前後でようやく違いが分かり、10 を超えれば別の色に見える。
+    fn delta_e(first: Color, second: Color) -> f64 {
+        let (l1, a1, b1) = to_lab(first);
+        let (l2, a2, b2) = to_lab(second);
+        ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
+    }
+
+    fn relative_luminance(color: Color) -> f64 {
+        0.2126 * to_linear(color.red)
+            + 0.7152 * to_linear(color.green)
+            + 0.0722 * to_linear(color.blue)
+    }
+
+    fn contrast_ratio(first: Color, second: Color) -> f64 {
+        let (first, second) = (relative_luminance(first), relative_luminance(second));
+        let (higher, lower) = if first >= second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        (higher + 0.05) / (lower + 0.05)
+    }
+
+    /// 隣り合いうる背景色の全組み合わせ。ワークツリーのセグメントは省略される
+    /// ことがあるので、ブランチ→差分の直結も含める。
+    fn adjacent_background_pairs() -> Vec<(String, Color, Color)> {
+        let mut pairs = vec![
+            ("identity → directory".to_string(), IDENTITY_BACKGROUND, DIRECTORY_BACKGROUND),
+            ("directory → model".to_string(), DIRECTORY_BACKGROUND, MODEL_BACKGROUND),
+            ("model → effort".to_string(), MODEL_BACKGROUND, EFFORT_BACKGROUND),
+            ("git → worktree".to_string(), GIT_BACKGROUND, WORKTREE_BACKGROUND),
+            ("git → diff".to_string(), GIT_BACKGROUND, DIFF_BACKGROUND),
+            ("worktree → diff".to_string(), WORKTREE_BACKGROUND, DIFF_BACKGROUND),
+        ];
+
+        for (index, context) in CONTEXT_BANDS.into_iter().enumerate() {
+            pairs.push((format!("effort → context[{index}]"), EFFORT_BACKGROUND, context));
+            for (rate, dark) in RATE_DARK_BANDS.into_iter().enumerate() {
+                pairs.push((format!("context[{index}] → 5h[{rate}]"), context, dark));
+            }
+        }
+
+        for (index, dark) in RATE_DARK_BANDS.into_iter().enumerate() {
+            for (rate, light) in RATE_LIGHT_BANDS.into_iter().enumerate() {
+                pairs.push((format!("5h[{index}] → 7d[{rate}]"), dark, light));
+            }
+        }
+
+        for (index, light) in RATE_LIGHT_BANDS.into_iter().enumerate() {
+            pairs.push((format!("7d[{index}] → git"), light, GIT_BACKGROUND));
+        }
+
+        pairs
+    }
+
+    /// 区切りは前のセグメントの背景色で描かれるため、隣り合う背景が近いと
+    /// 境界そのものが消える。WCAG のコントラスト比は輝度しか見ず色相差を
+    /// 無視する（緑と紫が「同じ」と判定されてしまう）ので、色差で検証する。
+    #[test]
+    fn adjacent_backgrounds_are_perceptually_distinct() {
+        for (label, first, second) in adjacent_background_pairs() {
+            let difference = delta_e(first, second);
+            assert!(
+                difference >= 20.0,
+                "{label}: 色差 {difference:.1} は近すぎて区切りが見えない"
+            );
+        }
+    }
+
+    /// 文字は WCAG AA（4.5）を満たすこと。中間輝度の背景は白でも黒でも
+    /// 比が上がらないので、この検証を通らない背景色は採用できない。
+    #[test]
+    fn segment_text_meets_wcag_aa() {
+        let mut pairs = vec![
+            ("identity", IDENTITY_BACKGROUND, WHITE),
+            ("directory", DIRECTORY_BACKGROUND, WHITE),
+            ("model", MODEL_BACKGROUND, WHITE),
+            ("effort", EFFORT_BACKGROUND, WHITE),
+            ("git", GIT_BACKGROUND, WHITE),
+            ("worktree", WORKTREE_BACKGROUND, WHITE),
+            ("diff", DIFF_BACKGROUND, DARK_TEXT),
+        ];
+        for context in CONTEXT_BANDS {
+            pairs.push(("context", context, DARK_TEXT));
+        }
+        for dark in RATE_DARK_BANDS {
+            pairs.push(("5h", dark, WHITE));
+        }
+        for light in RATE_LIGHT_BANDS {
+            pairs.push(("7d", light, DARK_TEXT));
+        }
+
+        for (label, background, text) in pairs {
+            let ratio = contrast_ratio(background, text);
+            assert!(ratio >= 4.5, "{label}: コントラスト比 {ratio:.2} は AA 未満");
+        }
+    }
+
+    /// バーは専用のトラックの上に描くので、グラデーションの全域でトラックと
+    /// 十分なコントラストが必要になる。
+    #[test]
+    fn usage_bar_is_legible_on_its_track() {
+        for percentage in 0..=100 {
+            let ratio = contrast_ratio(
+                get_usage_gradient(f64::from(percentage)),
+                BAR_TRACK_BACKGROUND,
+            );
+            assert!(ratio >= 4.0, "{percentage}%: コントラスト比 {ratio:.2}");
+        }
+
+        let empty = contrast_ratio(BAR_EMPTY_FOREGROUND, BAR_TRACK_BACKGROUND);
+        assert!(empty >= 1.8, "未使用部分のコントラスト比 {empty:.2}");
+    }
 }
