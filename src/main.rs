@@ -278,13 +278,17 @@ fn create_effort_text(label: &str) -> String {
     }
 }
 
+/// Claude Code の Effort は `low` / `medium` / `high` / `xhigh` / `max` の5段階。
+/// `minimal` という段階は存在せず、`xhigh` の上が `max` になる。ultracode は
+/// 独立した段階ではなく `xhigh` として報告される。対応しないモデルでは
+/// `effort` 自体が入力に現れない。
 fn get_effort_step(label: &str) -> Option<usize> {
     match label.trim().to_ascii_lowercase().as_str() {
-        "minimal" => Some(1),
-        "low" => Some(2),
-        "medium" => Some(3),
-        "high" => Some(4),
-        "xhigh" => Some(5),
+        "low" => Some(1),
+        "medium" => Some(2),
+        "high" => Some(3),
+        "xhigh" => Some(4),
+        "max" => Some(5),
         _ => None,
     }
 }
@@ -1602,13 +1606,14 @@ mod tests {
     #[test]
     fn effort_gauge_only_applies_to_known_levels() {
         for (label, expected) in [
-            ("Minimal", Some(1)),
-            ("Low", Some(2)),
-            ("Medium", Some(3)),
-            ("High", Some(4)),
-            ("Xhigh", Some(5)),
-            ("XHIGH", Some(5)),
+            ("Low", Some(1)),
+            ("Medium", Some(2)),
+            ("High", Some(3)),
+            ("Xhigh", Some(4)),
+            ("XHIGH", Some(4)),
+            ("Max", Some(5)),
             ("--", None),
+            ("Minimal", None),
             ("Turbo", None),
         ] {
             assert_eq!(get_effort_step(label), expected, "{label}");
