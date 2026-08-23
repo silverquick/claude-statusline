@@ -16,6 +16,11 @@ use serde_json::Value;
 
 const ESCAPE: &str = "\x1b[";
 const POWERLINE_RIGHT: char = '\u{e0b0}';
+// 隣接するセグメントの背景色が近いと実線の区切りは前の背景色で描かれるため消えてしまう。
+// その場合は細い区切りを文字色で描いて、境界を必ず見えるようにする。
+const POWERLINE_RIGHT_THIN: char = '\u{e0b1}';
+const SEPARATOR_MIN_CONTRAST: f64 = 1.6;
+const SEPARATOR_BLEND: f64 = 0.5;
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -30,21 +35,33 @@ const fn rgb(red: i32, green: i32, blue: i32) -> Color {
 }
 
 const MODEL_BACKGROUND: Color = rgb(185, 49, 49);
-const EFFORT_BACKGROUND: Color = rgb(155, 89, 182);
+const EFFORT_BACKGROUND: Color = rgb(108, 58, 132);
 const CONTEXT_LOW_BACKGROUND: Color = rgb(205, 154, 11);
 const CONTEXT_MEDIUM_BACKGROUND: Color = rgb(245, 196, 24);
-const CONTEXT_HIGH_BACKGROUND: Color = rgb(230, 126, 34);
-const CONTEXT_CRITICAL_BACKGROUND: Color = rgb(231, 76, 60);
+const CONTEXT_HIGH_BACKGROUND: Color = rgb(245, 138, 43);
+const CONTEXT_CRITICAL_BACKGROUND: Color = rgb(255, 107, 91);
 const DIRECTORY_BACKGROUND: Color = rgb(111, 78, 176);
-const RATE_LOW_BACKGROUND: Color = rgb(22, 135, 119);
-const RATE_MEDIUM_BACKGROUND: Color = rgb(205, 154, 11);
-const RATE_HIGH_BACKGROUND: Color = rgb(192, 57, 43);
-const GIT_BACKGROUND: Color = rgb(41, 128, 185);
+// 利用率は 5h と 7d が必ず隣り合う。同じしきい値なら同じ色になってしまうため、
+// 5h には暗い系（白文字）、7d には明るい系（黒文字）を割り当てて明暗を交互にする。
+// コンテキストも明るい系なので、Ctx → 5h → 7d は常に 明 → 暗 → 明 と並ぶ。
+const RATE_DARK_LOW_BACKGROUND: Color = rgb(16, 85, 74);
+const RATE_DARK_MEDIUM_BACKGROUND: Color = rgb(122, 84, 16);
+const RATE_DARK_HIGH_BACKGROUND: Color = rgb(158, 40, 30);
+const RATE_LIGHT_LOW_BACKGROUND: Color = rgb(72, 199, 176);
+const RATE_LIGHT_MEDIUM_BACKGROUND: Color = rgb(205, 154, 11);
+const RATE_LIGHT_HIGH_BACKGROUND: Color = rgb(255, 107, 91);
+const GIT_BACKGROUND: Color = rgb(29, 90, 130);
 const WORKTREE_BACKGROUND: Color = rgb(92, 72, 165);
 const DIFF_BACKGROUND: Color = rgb(39, 174, 96);
 const IDENTITY_BACKGROUND: Color = rgb(45, 106, 79);
 const WHITE: Color = rgb(255, 255, 255);
 const DARK_TEXT: Color = rgb(30, 36, 45);
+
+// 使用率バーは専用の暗いトラックの上に描く。セグメント背景も使用率で変わるため、
+// 同じ面にグラデーションを載せると高使用率で赤地に赤となり視認できなくなる。
+// トラックを挟むことで、どのセグメントでもコントラスト比 4.2 以上を保証する。
+const BAR_TRACK_BACKGROUND: Color = rgb(26, 30, 38);
+const BAR_EMPTY_FOREGROUND: Color = rgb(78, 86, 102);
 
 struct Segment {
     background: Color,
@@ -75,6 +92,14 @@ struct Repository {
     branch: Option<String>,
     worktree: Option<String>,
     is_unborn: bool,
+}
+
+/// 利用率セグメントの明暗。5h と 7d は必ず隣り合うため、同じしきい値でも
+/// 背景が一致しないよう、片方を暗い系、もう片方を明るい系に固定する。
+#[derive(Clone, Copy)]
+enum RateScale {
+    Dark,
+    Light,
 }
 
 fn main() {
@@ -116,7 +141,9 @@ fn build_status_line(root: &Value) -> String {
     let rates = get_rate_limits(root);
     let repository = find_repository(&directory, get_workspace_worktree(root));
 
-    let context_foreground = get_context_foreground(context.percentage_value);
+    // コンテキストは全帯を明るい系で揃えているため、文字色は常に暗色でよい。
+    let context_foreground = DARK_TEXT;
+    let context_background = get_context_background(context.percentage_value);
     // 並び順はシェルの PS1 と同じく `\u@\h` → `\w` から始め、そのあとに
     // セッション情報（モデル、Effort、コンテキスト）、利用率、Git情報と続く。
     let mut segments = vec![
@@ -141,12 +168,12 @@ fn build_status_line(root: &Value) -> String {
             text: format!(" {} ", get_main_effort(root)),
         },
         Segment {
-            background: get_context_background(context.percentage_value),
+            background: context_background,
             foreground: context_foreground,
-            text: create_context_text(&context, context_foreground),
+            text: create_context_text(&context, context_foreground, context_background),
         },
-        create_rate_segment("5h", rates.five_hour),
-        create_rate_segment("7d", rates.seven_day),
+        create_rate_segment("5h", rates.five_hour, RateScale::Dark),
+        create_rate_segment("7d", rates.seven_day, RateScale::Light),
     ];
 
     if let Some(repository) = repository {
@@ -169,9 +196,10 @@ fn build_status_line(root: &Value) -> String {
 
             if let Some((added, deleted)) = get_diff_stat(&repository, &directory) {
                 if added > 0 || deleted > 0 {
+                    // 明るい緑地なので、白文字ではコントラスト比 2.87 しか出ない。
                     segments.push(Segment {
                         background: DIFF_BACKGROUND,
-                        foreground: WHITE,
+                        foreground: DARK_TEXT,
                         text: format!(" (+{},-{}) ", added, deleted),
                     });
                 }
@@ -216,20 +244,20 @@ fn get_main_effort(root: &Value) -> String {
     }
 }
 
-fn create_context_text(context: &Context, foreground: Color) -> String {
+fn create_context_text(context: &Context, foreground: Color, background: Color) -> String {
     match context.percentage_value {
         None => format!(" {}/{} --% ", context.current, context.maximum),
         Some(value) => format!(
             " {}/{} {} {}% ",
             context.current,
             context.maximum,
-            build_usage_bar(value, foreground),
+            build_usage_bar(value, foreground, background),
             context.percentage
         ),
     }
 }
 
-fn build_usage_bar(percentage: f64, segment_foreground: Color) -> String {
+fn build_usage_bar(percentage: f64, segment_foreground: Color, segment_background: Color) -> String {
     const WIDTH: i32 = 10;
     const BLOCKS: [char; 9] = [
         ' ', '\u{258f}', '\u{258e}', '\u{258d}', '\u{258c}', '\u{258b}', '\u{258a}', '\u{2589}',
@@ -246,23 +274,31 @@ fn build_usage_bar(percentage: f64, segment_foreground: Color) -> String {
     };
     let empty = WIDTH - full - i32::from(fraction > 0);
 
-    let mut bar = String::new();
+    let mut filled_glyphs = String::new();
     for _ in 0..full.max(0) {
-        bar.push(BLOCKS[8]);
+        filled_glyphs.push(BLOCKS[8]);
     }
     if fraction > 0 {
-        bar.push(BLOCKS[fraction as usize]);
-    }
-    for _ in 0..empty.max(0) {
-        bar.push('\u{2591}');
+        filled_glyphs.push(BLOCKS[fraction as usize]);
     }
 
-    // Only the bar receives this SGR foreground; restore the segment foreground
-    // immediately without resetting its background or the Powerline connection.
+    let mut empty_glyphs = String::new();
+    for _ in 0..empty.max(0) {
+        empty_glyphs.push('\u{2591}');
+    }
+
+    // The bar sits on its own dark track so the gradient never has to compete
+    // with a segment background that encodes the same usage level. Both the
+    // track background and the bar foreground are restored to the segment's own
+    // colours afterwards, leaving the Powerline connection untouched.
     format!(
-        "{}{}{}",
+        "{}{}{}{}{}{}{}",
+        background(BAR_TRACK_BACKGROUND),
         foreground(get_usage_gradient(clamped)),
-        bar,
+        filled_glyphs,
+        foreground(BAR_EMPTY_FOREGROUND),
+        empty_glyphs,
+        background(segment_background),
         foreground(segment_foreground)
     )
 }
@@ -340,13 +376,6 @@ fn get_context_background(percentage: Option<f64>) -> Color {
         Some(value) if value >= 85.0 => CONTEXT_HIGH_BACKGROUND,
         Some(value) if value >= 70.0 => CONTEXT_MEDIUM_BACKGROUND,
         _ => CONTEXT_LOW_BACKGROUND,
-    }
-}
-
-fn get_context_foreground(percentage: Option<f64>) -> Color {
-    match percentage {
-        Some(value) if value >= 95.0 => WHITE,
-        _ => DARK_TEXT,
     }
 }
 
@@ -630,27 +659,28 @@ fn parse_reset_time(value: &Value) -> Option<DateTime<Utc>> {
     None
 }
 
-fn create_rate_segment(label: &str, limit: RateLimit) -> Segment {
+fn create_rate_segment(label: &str, limit: RateLimit, scale: RateScale) -> Segment {
     let percentage = limit.percentage;
-    let foreground = match percentage {
-        Some(value) if value >= 80.0 => WHITE,
-        _ => DARK_TEXT,
+    let foreground = match scale {
+        RateScale::Dark => WHITE,
+        RateScale::Light => DARK_TEXT,
     };
+    let background = get_rate_background(scale, percentage);
     let reset = format_reset(limit.resets_at);
 
     match percentage {
         None => Segment {
-            background: get_rate_background(None),
+            background,
             foreground,
             text: format!(" {}: --%{} ", label, reset),
         },
         Some(value) => Segment {
-            background: get_rate_background(Some(value)),
+            background,
             foreground,
             text: format!(
                 " {} {} {}%{} ",
                 label,
-                build_usage_bar(value, foreground),
+                build_usage_bar(value, foreground, background),
                 format_percentage(value),
                 reset
             ),
@@ -658,11 +688,24 @@ fn create_rate_segment(label: &str, limit: RateLimit) -> Segment {
     }
 }
 
-fn get_rate_background(percentage: Option<f64>) -> Color {
+fn get_rate_background(scale: RateScale, percentage: Option<f64>) -> Color {
+    let (low, medium, high) = match scale {
+        RateScale::Dark => (
+            RATE_DARK_LOW_BACKGROUND,
+            RATE_DARK_MEDIUM_BACKGROUND,
+            RATE_DARK_HIGH_BACKGROUND,
+        ),
+        RateScale::Light => (
+            RATE_LIGHT_LOW_BACKGROUND,
+            RATE_LIGHT_MEDIUM_BACKGROUND,
+            RATE_LIGHT_HIGH_BACKGROUND,
+        ),
+    };
+
     match percentage {
-        Some(value) if value >= 80.0 => RATE_HIGH_BACKGROUND,
-        Some(value) if value >= 50.0 => RATE_MEDIUM_BACKGROUND,
-        _ => RATE_LOW_BACKGROUND,
+        Some(value) if value >= 80.0 => high,
+        Some(value) if value >= 50.0 => medium,
+        _ => low,
     }
 }
 
@@ -972,9 +1015,24 @@ fn render_powerline(segments: &[Segment]) -> String {
         if index == 0 {
             output.push_str(&background(segment.background));
         } else {
-            output.push_str(&foreground(segments[index - 1].background));
-            output.push_str(&background(segment.background));
-            output.push(POWERLINE_RIGHT);
+            let previous = segments[index - 1].background;
+            if contrast_ratio(previous, segment.background) < SEPARATOR_MIN_CONTRAST {
+                // 実線の区切りは前のセグメントの背景色で描かれる。両者が近いと
+                // 境界が消えるため、細い区切りに切り替える。ここで文字色をそのまま
+                // 使うと実線の楔より目立ち、左右で見た目が揃わなくなるので、
+                // 地の色と文字色の中間で控えめに描く。
+                output.push_str(&background(segment.background));
+                output.push_str(&foreground(blend(
+                    segment.background,
+                    segment.foreground,
+                    SEPARATOR_BLEND,
+                )));
+                output.push(POWERLINE_RIGHT_THIN);
+            } else {
+                output.push_str(&foreground(previous));
+                output.push_str(&background(segment.background));
+                output.push(POWERLINE_RIGHT);
+            }
         }
 
         output.push_str(&foreground(segment.foreground));
@@ -989,6 +1047,46 @@ fn render_powerline(segments: &[Segment]) -> String {
     output.push_str(ESCAPE);
     output.push_str("0m");
     output
+}
+
+/// 2色を `ratio` の割合で混ぜる。0.0 で `from`、1.0 で `to` になる。
+fn blend(from: Color, to: Color, ratio: f64) -> Color {
+    let ratio = ratio.clamp(0.0, 1.0);
+    let channel = |from: i32, to: i32| {
+        (f64::from(from) + (f64::from(to) - f64::from(from)) * ratio).round() as i32
+    };
+
+    rgb(
+        channel(from.red, to.red),
+        channel(from.green, to.green),
+        channel(from.blue, to.blue),
+    )
+}
+
+/// WCAG 2.x の相対輝度。
+fn relative_luminance(color: Color) -> f64 {
+    fn channel(value: i32) -> f64 {
+        let value = f64::from(value.clamp(0, 255)) / 255.0;
+        if value <= 0.03928 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    0.2126 * channel(color.red) + 0.7152 * channel(color.green) + 0.0722 * channel(color.blue)
+}
+
+/// WCAG 2.x のコントラスト比。1.0（同色）から 21.0（黒と白）の範囲を取る。
+fn contrast_ratio(first: Color, second: Color) -> f64 {
+    let (first, second) = (relative_luminance(first), relative_luminance(second));
+    let (higher, lower) = if first >= second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+
+    (higher + 0.05) / (lower + 0.05)
 }
 
 fn foreground(color: Color) -> String {
