@@ -65,18 +65,27 @@ const BAR_TRACK_BACKGROUND: Color = rgb(26, 30, 38);
 const BAR_EMPTY_FOREGROUND: Color = rgb(78, 86, 102);
 
 // Effort は連続値ではなく5段階なので、割合を示すバーではなく段の数を示す
-// ゲージで描く。塗り色は Effort セグメントと同じ紫系で、位置が上がるほど
-// 明るくなる。これにより Effort が高いほどゲージ全体が明るく見える。
-// 5色を別々の色相にはせず、あくまで1本のランプとして読ませる。
+// ゲージで描く。ここでは2つの別々の見分けが同時に要る。
+//
+//   点灯と未点灯の区別 … 1マス幅の図と地の判別なので、輝度比が効く。
+//                        色差だけ大きくても暗い色どうしでは分離しない。
+//   段どうしの区別     … 数えられる必要があるので、色差を確保する。
+//
+// そのため点灯色は「確実に明るい」帯の中だけでランプを組み、未点灯は
+// はっきり暗くしている。塗りは1本の紫系ランプで、位置が上がるほど明るい。
+// Effort が高いほど明るい段まで届き、ゲージ全体が強く見える。
 const EFFORT_STEPS: usize = 5;
 const EFFORT_FILLED_BACKGROUNDS: [Color; EFFORT_STEPS] = [
-    rgb(106, 62, 158),
-    rgb(128, 85, 184),
-    rgb(150, 109, 208),
-    rgb(172, 134, 226),
-    rgb(196, 162, 242),
+    rgb(135, 103, 184),
+    rgb(159, 127, 204),
+    rgb(182, 153, 223),
+    rgb(205, 179, 238),
+    rgb(226, 208, 248),
 ];
-const EFFORT_EMPTY_BACKGROUND: Color = rgb(53, 40, 74);
+const EFFORT_EMPTY_BACKGROUND: Color = rgb(35, 29, 41);
+// 未点灯セルには使用率バーと同じ `░` を置く。色だけに頼らない手がかりを
+// 足すことで、点灯との違いと段数の両方が読み取れるようにする。
+const EFFORT_EMPTY_FOREGROUND: Color = rgb(94, 86, 105);
 const EFFORT_EMPTY_DIVIDER: Color = rgb(120, 100, 145);
 
 struct Segment {
@@ -305,7 +314,13 @@ fn build_effort_gauge(step: usize) -> String {
             gauge.push(POWERLINE_RIGHT);
         }
 
-        gauge.push(' ');
+        if index < step {
+            gauge.push(' ');
+        } else {
+            gauge.push_str(&foreground(EFFORT_EMPTY_FOREGROUND));
+            gauge.push('\u{2591}');
+        }
+
         previous = current;
     }
 
@@ -1490,8 +1505,12 @@ mod tests {
                 + gauge.matches(POWERLINE_RIGHT_THIN).count();
             assert_eq!(separators, EFFORT_STEPS + 1, "step {step}: 区切りの数");
 
-            let bodies = gauge.matches(' ').count();
-            assert_eq!(bodies, EFFORT_STEPS, "step {step}: 段の数");
+            assert_eq!(gauge.matches(' ').count(), step, "step {step}: 点灯セルの数");
+            assert_eq!(
+                gauge.matches('\u{2591}').count(),
+                EFFORT_STEPS - step,
+                "step {step}: 未点灯セルの数"
+            );
 
             for (index, filled) in EFFORT_FILLED_BACKGROUNDS.into_iter().enumerate() {
                 let present = gauge.contains(&background(filled));
@@ -1551,6 +1570,22 @@ mod tests {
         // 未点灯どうしは同色なので、細区切りだけが段の切れ目を示す。
         let divider = contrast_ratio(EFFORT_EMPTY_DIVIDER, EFFORT_EMPTY_BACKGROUND);
         assert!(divider >= 2.0, "細区切りのコントラスト比 {divider:.2}");
+
+        let glyph = contrast_ratio(EFFORT_EMPTY_FOREGROUND, EFFORT_EMPTY_BACKGROUND);
+        assert!(glyph >= 2.0, "未点灯の記号のコントラスト比 {glyph:.2}");
+    }
+
+    /// 点灯と未点灯の区別は1マス幅の図と地の判別なので、色差ではなく輝度比で
+    /// 決まる。色差だけ大きくても、暗い色どうしでは点灯しているように見えない。
+    #[test]
+    fn effort_gauge_lit_steps_stand_out_from_unlit() {
+        for (index, filled) in EFFORT_FILLED_BACKGROUNDS.into_iter().enumerate() {
+            let ratio = contrast_ratio(filled, EFFORT_EMPTY_BACKGROUND);
+            assert!(
+                ratio >= 3.5,
+                "段 {index}: 未点灯とのコントラスト比 {ratio:.2} では点灯が読み取れない"
+            );
+        }
     }
 
     /// 塗り色は位置が上がるほど明るくなること（Effort が高いほど強く見せる）。
