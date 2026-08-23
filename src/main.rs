@@ -76,34 +76,33 @@ const BAR_EMPTY_FOREGROUND: Color = rgb(78, 86, 102);
 // はっきり暗くしている。塗りは1本の紫系ランプで、位置が上がるほど明るい。
 // Effort が高いほど明るい段まで届き、ゲージ全体が強く見える。
 const EFFORT_STEPS: usize = 5;
-// 点灯色は時間で少しずつ色相が動く。statusline の再描画は `refreshInterval`
-// の最小値である1秒に1回が上限なので、1フレームあたりの変化を色差 4.4 に
-// 抑え、1周 14 秒でゆっくり流す。
+// ゲージは現在の段階まで1段ずつ点いていき、そこで止まる。段は3つの状態を取る。
 //
-// 動かすのは色相だけで、明度は段ごとに固定している。Lab では輝度が L* だけ
-// で決まるため、色相回転では点灯・未点灯の輝度比が数学的に変わらない。段の
-// 順序も崩れない。全段を同じ位相で動かすのは、段ごとにずらすと瞬間の色相幅
-// が 16 度を超えて「5段が別々の色」に見えてしまうため。
+//   点灯   すでに点いた段。彩度の高い紫
+//   待機   現在の段階の範囲内だが、まだ点いていない段。点灯と同じ明度で低彩度
+//   未点灯 現在の段階より上の段。暗い地に `░`
 //
-// 実行時に色空間の変換をせずに済むよう、また全位相を試験できるよう、
-// 値は事前に計算して表として持つ。
-const EFFORT_PHASES: usize = 14;
-const EFFORT_FILLED_ANIMATION: [[Color; EFFORT_STEPS]; EFFORT_PHASES] = [
-    [rgb(134, 106, 176), rgb(157, 129, 197), rgb(181, 154, 216), rgb(203, 181, 233), rgb(225, 209, 244)],
-    [rgb(143, 103, 171), rgb(166, 127, 192), rgb(188, 152, 212), rgb(210, 179, 229), rgb(229, 208, 242)],
-    [rgb(150, 100, 166), rgb(173, 125, 188), rgb(194, 150, 208), rgb(215, 178, 226), rgb(232, 207, 239)],
-    [rgb(153, 99, 164), rgb(176, 123, 185), rgb(197, 149, 205), rgb(217, 177, 224), rgb(234, 206, 238)],
-    [rgb(153, 99, 164), rgb(176, 123, 185), rgb(197, 149, 205), rgb(217, 177, 224), rgb(234, 206, 238)],
-    [rgb(150, 100, 166), rgb(173, 125, 188), rgb(194, 150, 208), rgb(215, 178, 226), rgb(232, 207, 239)],
-    [rgb(143, 103, 171), rgb(166, 127, 192), rgb(188, 152, 212), rgb(210, 179, 229), rgb(229, 208, 242)],
-    [rgb(134, 106, 176), rgb(157, 129, 197), rgb(181, 154, 216), rgb(203, 181, 233), rgb(225, 209, 244)],
-    [rgb(124, 109, 180), rgb(148, 132, 201), rgb(172, 157, 220), rgb(196, 183, 236), rgb(220, 210, 246)],
-    [rgb(115, 111, 183), rgb(140, 134, 204), rgb(165, 159, 222), rgb(191, 184, 238), rgb(216, 211, 248)],
-    [rgb(110, 112, 184), rgb(135, 135, 205), rgb(161, 160, 223), rgb(187, 185, 239), rgb(214, 212, 248)],
-    [rgb(110, 112, 184), rgb(135, 135, 205), rgb(161, 160, 223), rgb(187, 185, 239), rgb(214, 212, 248)],
-    [rgb(115, 111, 183), rgb(140, 134, 204), rgb(165, 159, 222), rgb(191, 184, 238), rgb(216, 211, 248)],
-    [rgb(124, 109, 180), rgb(148, 132, 201), rgb(172, 157, 220), rgb(196, 183, 236), rgb(220, 210, 246)],
+// 待機色を「同じ明度・低彩度」にしているのは、CIE Lab では輝度が L* だけで
+// 決まるためで、彩度を落としても未点灯との輝度比は変わらない。おかげで
+// アニメーションのどのコマでも現在の段階が読み取れる。明度の並び（段が
+// 上がるほど明るい）も崩れない。
+const EFFORT_LIT_BACKGROUNDS: [Color; EFFORT_STEPS] = [
+    rgb(135, 103, 184),
+    rgb(159, 127, 204),
+    rgb(182, 153, 223),
+    rgb(205, 179, 238),
+    rgb(226, 208, 248),
 ];
+const EFFORT_PENDING_BACKGROUNDS: [Color; EFFORT_STEPS] = [
+    rgb(123, 116, 131),
+    rgb(146, 140, 153),
+    rgb(169, 164, 176),
+    rgb(193, 188, 199),
+    rgb(217, 214, 221),
+];
+// 満ちきったあと次の周回まで留まるコマ数。再描画は毎秒1回が上限なので、
+// これがそのまま「止まって見える秒数」になる。
+const EFFORT_HOLD_FRAMES: usize = 4;
 const EFFORT_EMPTY_BACKGROUND: Color = rgb(35, 29, 41);
 // 未点灯セルには使用率バーと同じ `░` を置く。色だけに頼らない手がかりを
 // 足すことで、点灯との違いと段数の両方が読み取れるようにする。
@@ -311,12 +310,12 @@ fn create_effort_text(label: &str) -> String {
     }
 }
 
-/// 経過秒からアニメーションの位相を決める。時刻が取れない場合は固定の位相に
-/// 落ちるだけで、表示そのものは壊れない。
+/// アニメーションのコマ番号。周期は段階ごとに変わるので経過秒をそのまま渡す。
+/// 時刻が取れない場合は先頭のコマに落ちるだけで、表示は壊れない。
 fn current_phase() -> usize {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| (elapsed.as_secs() % EFFORT_PHASES as u64) as usize)
+        .map(|elapsed| elapsed.as_secs() as usize)
         .unwrap_or(0)
 }
 
@@ -339,12 +338,19 @@ fn get_effort_step(label: &str) -> Option<usize> {
 /// 区切りの前景に前の段の色、背景に次の段の色を置くことで台形が連続して見える。
 /// 最後にセグメント本来の色へ戻すので、外側の Powerline 接続には影響しない。
 fn build_effort_gauge(step: usize, phase: usize) -> String {
+    // 1コマ目は何も点いていない状態から始め、1段ずつ点けていき、現在の段階に
+    // 達したらしばらくそのまま留まる。段階より上の段には決して届かない。
+    let cycle = step + 1 + EFFORT_HOLD_FRAMES;
+    let lit = (phase % cycle).min(step);
+
     let mut gauge = String::new();
     let mut previous = EFFORT_BACKGROUND;
 
-    for (index, filled) in EFFORT_FILLED_ANIMATION[phase % EFFORT_PHASES].into_iter().enumerate() {
-        let current = if index < step {
-            filled
+    for index in 0..EFFORT_STEPS {
+        let current = if index < lit {
+            EFFORT_LIT_BACKGROUNDS[index]
+        } else if index < step {
+            EFFORT_PENDING_BACKGROUNDS[index]
         } else {
             EFFORT_EMPTY_BACKGROUND
         };
@@ -1551,35 +1557,67 @@ mod tests {
         }
     }
 
-    /// Effort は5段階なので、どの段階でも必ず5段が描かれ、点灯数が段階と
-    /// 一致していること。区切りは「5段ぶん＋ゲージを閉じるぶん」で6個になる。
+    /// どの段階・どのコマでも5段が描かれ、段階の範囲内の段と範囲外の段の数が
+    /// 一致すること。区切りは「5段ぶん＋ゲージを閉じるぶん」で6個になる。
     #[test]
     fn effort_gauge_always_shows_five_steps() {
-        for (step, phase) in (1..=EFFORT_STEPS).flat_map(|s| (0..EFFORT_PHASES).map(move |p| (s, p))) {
-            let gauge = build_effort_gauge(step, phase);
+        for step in 1..=EFFORT_STEPS {
+            for phase in 0..step + 1 + EFFORT_HOLD_FRAMES {
+                let gauge = build_effort_gauge(step, phase);
 
-            let separators = gauge.matches(POWERLINE_RIGHT).count()
-                + gauge.matches(POWERLINE_RIGHT_THIN).count();
-            assert_eq!(separators, EFFORT_STEPS + 1, "step {step}: 区切りの数");
+                let separators = gauge.matches(POWERLINE_RIGHT).count()
+                    + gauge.matches(POWERLINE_RIGHT_THIN).count();
+                assert_eq!(separators, EFFORT_STEPS + 1, "step {step} phase {phase}: 区切りの数");
 
-            assert_eq!(gauge.matches(' ').count(), step, "step {step}: 点灯セルの数");
-            assert_eq!(
-                gauge.matches('\u{2591}').count(),
-                EFFORT_STEPS - step,
-                "step {step}: 未点灯セルの数"
-            );
-
-            for (index, filled) in EFFORT_FILLED_ANIMATION[phase].into_iter().enumerate() {
-                let present = gauge.contains(&background(filled));
-                assert_eq!(present, index < step, "step {step} phase {phase}: 段 {index} の点灯状態");
+                assert_eq!(
+                    gauge.matches(' ').count(),
+                    step,
+                    "step {step} phase {phase}: 段階の範囲内の段の数"
+                );
+                assert_eq!(
+                    gauge.matches('\u{2591}').count(),
+                    EFFORT_STEPS - step,
+                    "step {step} phase {phase}: 段階の範囲外の段の数"
+                );
             }
+        }
+    }
 
-            let empty_expected = step < EFFORT_STEPS;
+    /// アニメーションは現在の段階まで1段ずつ満ちていき、そこで止まること。
+    /// 段階より上の段が点いてはならない。
+    #[test]
+    fn effort_gauge_fills_up_to_the_level_and_stops() {
+        for step in 1..=EFFORT_STEPS {
+            let cycle = step + 1 + EFFORT_HOLD_FRAMES;
+            let lit_counts: Vec<usize> = (0..cycle)
+                .map(|phase| {
+                    let gauge = build_effort_gauge(step, phase);
+                    EFFORT_LIT_BACKGROUNDS
+                        .into_iter()
+                        .filter(|color| gauge.contains(&background(*color)))
+                        .count()
+                })
+                .collect();
+
+            let expected: Vec<usize> = (0..cycle).map(|phase| phase.min(step)).collect();
+            assert_eq!(lit_counts, expected, "step {step}: 満ち方");
+
             assert_eq!(
-                gauge.contains(&background(EFFORT_EMPTY_BACKGROUND)),
-                empty_expected,
-                "step {step}: 未点灯の有無"
+                lit_counts.iter().filter(|count| **count == step).count(),
+                EFFORT_HOLD_FRAMES + 1,
+                "step {step}: 満ちきったあと留まるコマ数"
             );
+
+            // 段階より上の段は、どのコマでも点灯色にならない。
+            for phase in 0..cycle * 3 {
+                let gauge = build_effort_gauge(step, phase);
+                for (above, color) in EFFORT_LIT_BACKGROUNDS.into_iter().enumerate().skip(step) {
+                    assert!(
+                        !gauge.contains(&background(color)),
+                        "step {step} phase {phase}: 段 {above} が点いている"
+                    );
+                }
+            }
         }
     }
 
@@ -1594,42 +1632,80 @@ mod tests {
             foreground(WHITE)
         );
         for step in 1..=EFFORT_STEPS {
-            for phase in 0..EFFORT_PHASES {
-                assert!(build_effort_gauge(step, phase).ends_with(&tail), "step {step} phase {phase}");
+            for phase in 0..step + 1 + EFFORT_HOLD_FRAMES {
+                assert!(
+                    build_effort_gauge(step, phase).ends_with(&tail),
+                    "step {step} phase {phase}"
+                );
             }
         }
     }
 
-    /// 段の境界が見えること。塗り同士はランプとして読ませたいので控えめでよいが、
-    /// 水位（塗り→未点灯）は一目で分からなければならない。
+    /// 待機色は点灯色と同じ明度で彩度だけを落としたもの。輝度が一致していれば、
+    /// アニメーションのどのコマでも「段階の範囲内かどうか」が同じ強さで読める。
+    #[test]
+    fn effort_pending_matches_lit_luminance() {
+        for index in 0..EFFORT_STEPS {
+            let lit = relative_luminance(EFFORT_LIT_BACKGROUNDS[index]);
+            let pending = relative_luminance(EFFORT_PENDING_BACKGROUNDS[index]);
+            let ratio = if lit >= pending { lit / pending } else { pending / lit };
+            assert!(ratio <= 1.05, "段 {index}: 点灯と待機の輝度が {ratio:.3} 倍ずれている");
+        }
+    }
+
+    /// 点灯・待機のどちらも、範囲外の段とは輝度で分離していること。1マス幅の
+    /// 図と地の判別なので、色差ではなく輝度比で決まる。
+    #[test]
+    fn effort_gauge_lit_steps_stand_out_from_unlit() {
+        for index in 0..EFFORT_STEPS {
+            for (label, color) in [
+                ("点灯", EFFORT_LIT_BACKGROUNDS[index]),
+                ("待機", EFFORT_PENDING_BACKGROUNDS[index]),
+            ] {
+                let ratio = contrast_ratio(color, EFFORT_EMPTY_BACKGROUND);
+                assert!(ratio >= 3.5, "段 {index} の{label}: コントラスト比 {ratio:.2}");
+            }
+        }
+    }
+
+    /// 隣り合う段の境界が見えること。アニメーション中は点灯と待機が隣り合うので、
+    /// 同じ状態どうしだけでなく状態をまたぐ組み合わせも確かめる。
     #[test]
     fn effort_gauge_steps_are_distinguishable() {
-        for (phase, steps) in EFFORT_FILLED_ANIMATION.into_iter().enumerate() {
-            for index in 0..EFFORT_STEPS - 1 {
-                let difference = delta_e(steps[index], steps[index + 1]);
-                assert!(
-                    difference >= 8.0,
-                    "phase {phase} 塗り{index}→{}: 色差 {difference:.1}",
-                    index + 1
-                );
-            }
-
-            for (index, filled) in steps.into_iter().enumerate() {
-                let difference = delta_e(filled, EFFORT_EMPTY_BACKGROUND);
-                assert!(difference >= 20.0, "phase {phase} 塗り{index}→未点灯: 色差 {difference:.1}");
-            }
-
+        for index in 0..EFFORT_STEPS - 1 {
             for (label, first, second) in [
-                ("背景→塗り1", EFFORT_BACKGROUND, steps[0]),
-                ("未点灯→背景", EFFORT_EMPTY_BACKGROUND, EFFORT_BACKGROUND),
-                ("塗り5→背景", steps[EFFORT_STEPS - 1], EFFORT_BACKGROUND),
+                ("点灯→点灯", EFFORT_LIT_BACKGROUNDS[index], EFFORT_LIT_BACKGROUNDS[index + 1]),
+                ("待機→待機", EFFORT_PENDING_BACKGROUNDS[index], EFFORT_PENDING_BACKGROUNDS[index + 1]),
+                ("点灯→待機", EFFORT_LIT_BACKGROUNDS[index], EFFORT_PENDING_BACKGROUNDS[index + 1]),
+                ("待機→点灯", EFFORT_PENDING_BACKGROUNDS[index], EFFORT_LIT_BACKGROUNDS[index + 1]),
             ] {
                 let difference = delta_e(first, second);
-                assert!(difference >= 8.0, "phase {phase} {label}: 色差 {difference:.1}");
+                assert!(difference >= 8.0, "段 {index} {label}: 色差 {difference:.1}");
             }
         }
 
-        // 未点灯どうしは同色なので、細区切りだけが段の切れ目を示す。
+        // 水位（段階の内と外）と、ゲージの出入り。
+        for index in 0..EFFORT_STEPS {
+            for (label, color) in [
+                ("点灯", EFFORT_LIT_BACKGROUNDS[index]),
+                ("待機", EFFORT_PENDING_BACKGROUNDS[index]),
+            ] {
+                let difference = delta_e(color, EFFORT_EMPTY_BACKGROUND);
+                assert!(difference >= 20.0, "段 {index} の{label}→範囲外: 色差 {difference:.1}");
+            }
+        }
+
+        for (label, first, second) in [
+            ("背景→点灯1", EFFORT_BACKGROUND, EFFORT_LIT_BACKGROUNDS[0]),
+            ("背景→待機1", EFFORT_BACKGROUND, EFFORT_PENDING_BACKGROUNDS[0]),
+            ("未点灯→背景", EFFORT_EMPTY_BACKGROUND, EFFORT_BACKGROUND),
+            ("点灯5→背景", EFFORT_LIT_BACKGROUNDS[EFFORT_STEPS - 1], EFFORT_BACKGROUND),
+            ("待機5→背景", EFFORT_PENDING_BACKGROUNDS[EFFORT_STEPS - 1], EFFORT_BACKGROUND),
+        ] {
+            let difference = delta_e(first, second);
+            assert!(difference >= 8.0, "{label}: 色差 {difference:.1}");
+        }
+
         let divider = contrast_ratio(EFFORT_EMPTY_DIVIDER, EFFORT_EMPTY_BACKGROUND);
         assert!(divider >= 2.0, "細区切りのコントラスト比 {divider:.2}");
 
@@ -1637,91 +1713,18 @@ mod tests {
         assert!(glyph >= 2.0, "未点灯の記号のコントラスト比 {glyph:.2}");
     }
 
-    /// 点灯と未点灯の区別は1マス幅の図と地の判別なので、色差ではなく輝度比で
-    /// 決まる。色差だけ大きくても、暗い色どうしでは点灯しているように見えない。
-    #[test]
-    fn effort_gauge_lit_steps_stand_out_from_unlit() {
-        for (phase, steps) in EFFORT_FILLED_ANIMATION.into_iter().enumerate() {
-            for (index, filled) in steps.into_iter().enumerate() {
-                let ratio = contrast_ratio(filled, EFFORT_EMPTY_BACKGROUND);
-                assert!(
-                    ratio >= 3.5,
-                    "phase {phase} 段 {index}: 未点灯とのコントラスト比 {ratio:.2}"
-                );
-            }
-        }
-    }
-
-    /// 塗り色は位置が上がるほど明るくなること（Effort が高いほど強く見せる）。
+    /// 段が上がるほど明るくなること。点灯・待機のどちらの並びでも保つ。
     #[test]
     fn effort_gauge_brightens_with_each_step() {
-        for (phase, steps) in EFFORT_FILLED_ANIMATION.into_iter().enumerate() {
+        for (label, ramp) in [
+            ("点灯", EFFORT_LIT_BACKGROUNDS),
+            ("待機", EFFORT_PENDING_BACKGROUNDS),
+        ] {
             for index in 0..EFFORT_STEPS - 1 {
-                let lower = relative_luminance(steps[index]);
-                let higher = relative_luminance(steps[index + 1]);
-                assert!(higher > lower, "phase {phase}: 段 {index} より次の段が明るくない");
+                let lower = relative_luminance(ramp[index]);
+                let higher = relative_luminance(ramp[index + 1]);
+                assert!(higher > lower, "{label}: 段 {index} より次の段が明るくない");
             }
-        }
-    }
-
-    /// アニメーションは明度ではなく色相だけを動かす。明度が動くと点灯・未点灯の
-    /// 見分けが位相によってぶれてしまう。
-    #[test]
-    fn effort_animation_holds_each_step_luminance_steady() {
-        for index in 0..EFFORT_STEPS {
-            let values: Vec<f64> = EFFORT_FILLED_ANIMATION
-                .iter()
-                .map(|steps| relative_luminance(steps[index]))
-                .collect();
-            let highest = values.iter().cloned().fold(f64::MIN, f64::max);
-            let lowest = values.iter().cloned().fold(f64::MAX, f64::min);
-            assert!(
-                highest / lowest <= 1.05,
-                "段 {index}: 位相で輝度が {:.3} 倍動いている",
-                highest / lowest
-            );
-        }
-    }
-
-    /// 再描画は毎秒1回が上限なので、1フレームの変化が大きいとちらついて見え、
-    /// 小さすぎると止まって見える。連続する位相の色差を両側から挟む。
-    #[test]
-    fn effort_animation_advances_smoothly() {
-        let mut largest: f64 = 0.0;
-        for (phase, steps) in EFFORT_FILLED_ANIMATION.into_iter().enumerate() {
-            let next = EFFORT_FILLED_ANIMATION[(phase + 1) % EFFORT_PHASES];
-            for (index, color) in steps.into_iter().enumerate() {
-                let difference = delta_e(color, next[index]);
-                assert!(
-                    difference <= 5.0,
-                    "phase {phase} 段 {index}: 1フレームの色差 {difference:.1} はちらつく"
-                );
-                largest = largest.max(difference);
-            }
-        }
-
-        assert!(largest >= 2.0, "1フレームの色差が最大 {largest:.1} では動いて見えない");
-    }
-
-    /// 全段が同じ位相で動くこと。段ごとにずらすと瞬間の色相幅が広がり、
-    /// 「5段が別々の色」に見えてしまう。
-    #[test]
-    fn effort_animation_keeps_one_hue_family() {
-        for (phase, steps) in EFFORT_FILLED_ANIMATION.into_iter().enumerate() {
-            let hues: Vec<f64> = steps
-                .into_iter()
-                .map(|color| {
-                    let (_, a, b) = to_lab(color);
-                    b.atan2(a).to_degrees()
-                })
-                .collect();
-            let highest = hues.iter().cloned().fold(f64::MIN, f64::max);
-            let lowest = hues.iter().cloned().fold(f64::MAX, f64::min);
-            assert!(
-                highest - lowest <= 12.0,
-                "phase {phase}: 瞬間の色相幅 {:.1} 度",
-                highest - lowest
-            );
         }
     }
 
