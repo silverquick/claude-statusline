@@ -435,15 +435,22 @@ Powerlineの区切り `` は、**前のセグメントの背景色**で描かれ
 
 ### `--subagent` モード
 
-最初の引数が `--subagent` の場合、入力JSONの `tasks` 配列を処理します。表示可能な各タスクについて、次の形式を1行ずつ出力します。
+最初の引数が `--subagent` の場合、入力JSONの `columns`（端末幅）と `tasks` 配列を処理します。表示可能な各タスクについて、次の形式を1行ずつ出力します。
 
 ```json
 {"id":"<task id>","content":"<ANSI装飾済みの表示文字列>"}
 ```
 
-`content` には、存在する場合にモデル、Effort、Effortの段数ゲージ、トークン数またはコンテキスト使用率、説明を含めます。
+`content` は通常モードと同じ `render_powerline` で組んだ1行で、左から次のセグメントが並びます。いずれも値が取れなければセグメントごと省略します。
 
-サブエージェント行は Powerline セグメントではなく**端末の地の上に直接**描かれます。そのためゲージの外側の背景色が分からず、先頭の楔は描かずに最初の段から始めます。末尾は端末の既定の背景へ戻してから閉じ、装飾が行の続きへ漏れないよう完全にリセットします。この形での表示幅は段5つと区切り5つで10桁ちょうどで、説明文の切り詰め計算もこの幅を見込んでいます。
+1. モデル（`prettify_model` で整形）
+2. Effort（既知の5段階なら、本体の statusline と同じ段数ゲージを見出しに添えます。Powerline セグメントの中に描くのでゲージの外側の色は分かっており、`create_effort_text` が `build_effort_gauge(step, current_phase(), Some(EFFORT_BACKGROUND))` をそのまま使い回しています。数値のトークン予算や未知の値は段が定まらないため、ラベルだけになります）
+3. コンテキスト（トークン数と使用率。使用率バーは幅を優先して省き、`contextWindowSize` が無ければトークン数のみ表示します）。**このセグメントは常に出します。** `tokenCount` が取れない場合は ` -- ` になります。省略せずに常に置くのは、Effortと進捗のあいだを必ず埋めるためです — どちらも紫系の配色なので、コンテキストを飛ばして直接隣り合うと色差が20を切り、区切りが見えなくなります
+4. 進捗（経過時間と、`tokenSamples` の隣接差分を8段階のスパークライン `▁▂▃▄▅▆▇█` で示したもの。`tokenSamples` にはタイムスタンプが無いため、毎秒のレートは出しません）
+5. エージェント（`name`、無ければ `type` を `bash` / `workflow` / `remote` / `teammate` に短縮したもの。`local_agent` で `name` が無い場合は名乗りようがないので省略します）
+6. ラベル（`label`、無ければ `description`）
+
+モデル・Effort・`tokenCount`・進捗・エージェント・ラベルがすべて欠けている場合に限り、行そのものを出しません（コンテキストは常に構築されるため、この判定からは除きます）。
 
 サブエージェントの `effort` は段階名（`low`〜`max`）**または数値のトークン予算**です。段階名のときだけゲージを添え、数値予算のときは段に落とし込めないため数値のまま表示します。
 
@@ -462,10 +469,18 @@ task:         contextWindowSize, cwd, description, id, label, model,
 | 会話ログを読む | 4.1ms |
 | 読まない（`transcript_path` なし） | 2.8ms |
 
-```text
-Opus 5  High   ■▶■▶■▶░▏░▶  45k/200k 23% · 説明
-Haiku 4.5  12k  190k/200k 95% · 数値予算なのでゲージなし
-```
+`columns`（無ければ60）から4桁を引いた値を表示予算とし、超える場合は次の順に削ります。
+
+1. Effortセグメントからゲージを落とし、段階名だけにする（表示幅で約10桁の削減）
+2. ラベルを `...` 付きで切り詰め、10桁未満しか残らないならセグメントごと削除
+3. スパークラインを削除
+4. エージェントセグメントを削除
+5. 経過時間を削除（結果として進捗セグメントが空になれば削除）
+6. Effortセグメントを削除
+
+モデルとコンテキストは、予算をどれだけ超えても常に残します。
+
+幅の計算とラベルの切り詰めは**表示幅**（東アジアの全角文字を2桁として数える）で行います。依存クレートを増やさないため、East Asian Wide / Fullwidthの主要な範囲を自前の小さな判定テーブルで持っています。結合文字（U+0300–036F）は0桁、スパークラインの `▁`–`█`（East Asian Ambiguousですが現代の端末では1桁で描かれます）は1桁のまま扱います。切り詰めは全角文字の途中で半端な1桁が余っても割らず、文字境界で止めます。ゲージ入りのEffortセグメントは色を切り替えるANSIエスケープシーケンス（`\x1b[...m`）を文字列の中に含むため、`display_width` はこれを `\x1b[` から `m` までまとめて読み飛ばし、0桁として扱います。
 
 ## スモークテスト
 
@@ -485,7 +500,7 @@ printf '%s\n' '{"model":{"display_name":"Example"},"workspace":{"current_dir":"/
 
 ```sh
 binary="$HOME/.local/bin/StatusLinePowerline"
-printf '%s\n' '{"tasks":[{"id":"task-1","model":"claude-opus-5","effort":"high","tokenCount":12000,"contextWindowSize":200000,"description":"status check"}]}' |
+printf '%s\n' '{"columns":80,"tasks":[{"id":"task-1","name":"Explore","type":"local_agent","model":"claude-opus-5","effort":"high","tokenCount":12000,"contextWindowSize":200000,"startTime":1756000000000,"tokenSamples":[500,3000,7000,12000],"label":"status check"}]}' |
   "$binary" --subagent
 ```
 
@@ -503,7 +518,7 @@ $binary = "$HOME/.local/bin/StatusLinePowerline.exe"
 
 ```powershell
 $binary = "$HOME/.local/bin/StatusLinePowerline.exe"
-'{"columns":80,"tasks":[{"id":"task-1","model":"claude-opus-5","effort":"high","tokenCount":12000,"contextWindowSize":200000,"description":"status check"}]}' |
+'{"columns":80,"tasks":[{"id":"task-1","name":"Explore","type":"local_agent","model":"claude-opus-5","effort":"high","tokenCount":12000,"contextWindowSize":200000,"startTime":1756000000000,"tokenSamples":[500,3000,7000,12000],"label":"status check"}]}' |
   & $binary --subagent
 ```
 

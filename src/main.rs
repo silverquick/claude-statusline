@@ -19,8 +19,7 @@ const ESCAPE: &str = "\x1b[";
 // 隣り合う背景が知覚的に十分離れている必要がある。この条件は tests で
 // 機械的に検証している。
 const POWERLINE_RIGHT: char = '\u{e0b0}';
-// 細い区切りは、両側の背景色が文字どおり同一で実線の楔が原理的に描けない
-// 箇所にだけ使う。Effort ゲージの未点灯どうしがこれにあたる。
+// 同じ背景どうしを区切る細い楔。黒い空セルのあいだだけで使う。
 const POWERLINE_RIGHT_THIN: char = '\u{e0b1}';
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
@@ -65,25 +64,18 @@ const DARK_TEXT: Color = rgb(30, 36, 45);
 const BAR_TRACK_BACKGROUND: Color = rgb(26, 30, 38);
 const BAR_EMPTY_FOREGROUND: Color = rgb(78, 86, 102);
 
-// Effort は連続値ではなく5段階なので、割合を示すバーではなく段の数を示す
-// ゲージで描く。ここでは2つの別々の見分けが同時に要る。
-//
-//   点灯と未点灯の区別 … 1マス幅の図と地の判別なので、輝度比が効く。
-//                        色差だけ大きくても暗い色どうしでは分離しない。
-//   段どうしの区別     … 数えられる必要があるので、色差を確保する。
-//
-// そのため点灯色は「確実に明るい」帯の中だけでランプを組み、未点灯は
-// はっきり暗くしている。塗りは1本の紫系ランプで、位置が上がるほど明るい。
-// Effort が高いほど明るい段まで届き、ゲージ全体が強く見える。
+// Effort は連続値ではなく5段階なので、割合を示すバーではなく5セルの段数
+// ゲージで描く。現在の段階までを紫で描き、上の段も黒い空セルとして残す。
+// 塗りは1本の紫系ランプで、位置が上がるほど明るい。Effort が高いほど
+// 明るい段まで届き、ゲージ全体が強く見える。
 const EFFORT_STEPS: usize = 5;
-// ゲージは現在の段階まで1段ずつ点いていき、そこで止まる。段は3つの状態を取る。
+// ゲージは現在の段階まで1段ずつ点いていき、そこで止まる。段は2つの状態を取る。
 //
 //   点灯   すでに点いた段。彩度の高い紫
 //   待機   現在の段階の範囲内だが、まだ点いていない段。点灯と同じ明度で低彩度
-//   未点灯 現在の段階より上の段。暗い地に `░`
 //
 // 待機色を「同じ明度・低彩度」にしているのは、CIE Lab では輝度が L* だけで
-// 決まるためで、彩度を落としても未点灯との輝度比は変わらない。おかげで
+// 決まるためで、彩度を落としても点灯の並びの明度は変わらない。おかげで
 // アニメーションのどのコマでも現在の段階が読み取れる。明度の並び（段が
 // 上がるほど明るい）も崩れない。
 const EFFORT_LIT_BACKGROUNDS: [Color; EFFORT_STEPS] = [
@@ -103,12 +95,9 @@ const EFFORT_PENDING_BACKGROUNDS: [Color; EFFORT_STEPS] = [
 // 満ちきったあと次の周回まで留まるコマ数。再描画は毎秒1回が上限なので、
 // これがそのまま「止まって見える秒数」になる。
 const EFFORT_HOLD_FRAMES: usize = 4;
-// 端末の地の上へ描くときのゲージの表示幅。段5つと、段間4つ＋末尾1つの区切り。
-const EFFORT_GAUGE_WIDTH: usize = EFFORT_STEPS * 2;
+// 現在の段階より上も、文字を置かない黒いセルとして残す。
 const EFFORT_EMPTY_BACKGROUND: Color = rgb(35, 29, 41);
-// 未点灯セルには使用率バーと同じ `░` を置く。色だけに頼らない手がかりを
-// 足すことで、点灯との違いと段数の両方が読み取れるようにする。
-const EFFORT_EMPTY_FOREGROUND: Color = rgb(94, 86, 105);
+// 同色の空セルの境界だけは実線の楔にできないため、細い区切りを描く。
 const EFFORT_EMPTY_DIVIDER: Color = rgb(120, 100, 145);
 
 struct Segment {
@@ -188,6 +177,7 @@ fn build_status_line(root: &Value) -> String {
     let context = get_context(root);
     let rates = get_rate_limits(root);
     let repository = find_repository(&directory, get_workspace_worktree(root));
+    let main_effort = get_main_effort(root);
 
     // コンテキストは全帯を明るい系で揃えているため、文字色は常に暗色でよい。
     let context_foreground = DARK_TEXT;
@@ -213,7 +203,7 @@ fn build_status_line(root: &Value) -> String {
         Segment {
             background: EFFORT_BACKGROUND,
             foreground: WHITE,
-            text: create_effort_text(&get_main_effort(root)),
+            text: create_effort_text(&main_effort),
         },
         Segment {
             background: context_background,
@@ -241,7 +231,7 @@ fn build_status_line(root: &Value) -> String {
                 background: GIT_BACKGROUND,
                 foreground: WHITE,
                 text: format!(" \u{2387} {} ", clean_text(branch)),
-            });
+                });
 
             if let Some(worktree) = repository.worktree.as_deref() {
                 if !is_blank(worktree) {
@@ -249,7 +239,7 @@ fn build_status_line(root: &Value) -> String {
                         background: WORKTREE_BACKGROUND,
                         foreground: WHITE,
                         text: format!(" WT: {} ", clean_text(worktree)),
-                    });
+                                });
                 }
             }
 
@@ -260,7 +250,7 @@ fn build_status_line(root: &Value) -> String {
                         background: DIFF_BACKGROUND,
                         foreground: DARK_TEXT,
                         text: format!(" (+{},-{}) ", added, deleted),
-                    });
+                                });
                 }
             }
         }
@@ -303,8 +293,8 @@ fn get_main_effort(root: &Value) -> String {
     }
 }
 
-/// Effort の表示。既知の5段階なら見出しのあとに段数ゲージを添える。
-/// 未知の値や `--` のときは、置く位置が決められないのでゲージを出さない。
+/// Effort の表示。既知の5段階なら見出しのあとに、常に5セルのゲージを添える。
+/// 未知の値や `--` のときは、段が決められないのでゲージを出さない。
 fn create_effort_text(label: &str) -> String {
     match get_effort_step(label) {
         Some(step) => format!(" {} {} ", label, build_effort_gauge(step, current_phase(), Some(EFFORT_BACKGROUND))),
@@ -336,16 +326,17 @@ fn get_effort_step(label: &str) -> Option<usize> {
     }
 }
 
-/// 5段を斜めの境界でつないだゲージ。各段は「区切り＋1マスの地」でできており、
-/// 区切りの前景に前の段の色、背景に次の段の色を置くことで台形が連続して見える。
+/// 最大5段を斜めの境界でつないだゲージ。各段は「区切り＋1マスの地」でできる。
+/// 現在の段階までの地は紫、上の段は文字を置かない黒い地にする。同じ黒地が
+/// 連続する箇所だけは細い楔で区切るので、5段すべてが読め、各セルの地も途切れない。
 /// 最後にセグメント本来の色へ戻すので、外側の Powerline 接続には影響しない。
-/// 5段ゲージを組み立てる。`surround` はゲージの外側の背景色で、Powerline
-/// セグメントの中に描くときはその背景色を渡す。サブエージェント行のように
-/// 端末の地の上へ直接描くときは `None` を渡す。外側の色が分からないと
-/// ゲージ先頭の楔は描けないので、その場合は最初の段から始める。
+/// `surround` はゲージの外側の背景色で、Powerline セグメントの中に描くときは
+/// その背景色を渡す。サブエージェント行のように端末の地の上へ直接描くときは
+/// `None` を渡す。外側の色が分からないとゲージ先頭の楔は描けないので、その
+/// 場合は最初の段から始める。
 fn build_effort_gauge(step: usize, phase: usize, surround: Option<Color>) -> String {
     // 1コマ目は何も点いていない状態から始め、1段ずつ点けていき、現在の段階に
-    // 達したらしばらくそのまま留まる。段階より上の段には決して届かない。
+    // 達したらしばらくそのまま留まる。段階より上のセルも黒い地として残す。
     let cycle = step + 1 + EFFORT_HOLD_FRAMES;
     let lit = (phase % cycle).min(step);
 
@@ -353,36 +344,33 @@ fn build_effort_gauge(step: usize, phase: usize, surround: Option<Color>) -> Str
     let mut previous = surround;
 
     for index in 0..EFFORT_STEPS {
-        let current = if index < lit {
-            EFFORT_LIT_BACKGROUNDS[index]
-        } else if index < step {
-            EFFORT_PENDING_BACKGROUNDS[index]
+        let current = if index < step {
+            if index < lit {
+                EFFORT_LIT_BACKGROUNDS[index]
+            } else {
+                EFFORT_PENDING_BACKGROUNDS[index]
+            }
         } else {
             EFFORT_EMPTY_BACKGROUND
         };
 
         match previous {
-            // 未点灯どうしは背景が同一で、実線の楔は原理的に描けない。
-            // 5段あることが分かるよう、細い区切りで段の切れ目だけを示す。
-            Some(prev) if prev == current => {
+            Some(previous) if previous == current => {
+                // 両側が同じ黒地では実線の楔が消える。細い楔も黒地の上で描き、
+                // どちらの空セルにも別の背景色を混ぜない。
                 gauge.push_str(&foreground(EFFORT_EMPTY_DIVIDER));
+                gauge.push_str(&background(current));
                 gauge.push(POWERLINE_RIGHT_THIN);
             }
-            Some(prev) => {
-                gauge.push_str(&foreground(prev));
+            Some(previous) => {
+                gauge.push_str(&foreground(previous));
                 gauge.push_str(&background(current));
                 gauge.push(POWERLINE_RIGHT);
             }
             None => gauge.push_str(&background(current)),
         }
 
-        if index < step {
-            gauge.push(' ');
-        } else {
-            gauge.push_str(&foreground(EFFORT_EMPTY_FOREGROUND));
-            gauge.push('\u{2591}');
-        }
-
+        gauge.push(' ');
         previous = Some(current);
     }
 
@@ -1279,10 +1267,6 @@ fn background(color: Color) -> String {
     format!("{}48;2;{};{};{}m", ESCAPE, color.red, color.green, color.blue)
 }
 
-fn ansi(code: &str, text: &str) -> String {
-    format!("{}{}m{}{}0m", ESCAPE, code, text, ESCAPE)
-}
-
 // ------------------------------------------------------------------ subagents
 
 fn write_subagent_status(root: &Value) {
@@ -1292,6 +1276,7 @@ fn write_subagent_status(root: &Value) {
 
     let session_effort = get_effort(root).or_else(|| get_transcript_effort(root));
     let columns = get_number(root, "columns").filter(|value| *value > 0.0).map(|value| value as i64);
+    let now_ms = current_time_millis();
 
     for task in tasks {
         if !task.is_object() {
@@ -1302,7 +1287,7 @@ fn write_subagent_status(root: &Value) {
             continue;
         };
 
-        if let Some(content) = build_subagent_content(task, session_effort.as_deref(), columns) {
+        if let Some(content) = build_subagent_content(task, session_effort.as_deref(), columns, now_ms) {
             println!(
                 "{{\"id\":{},\"content\":{}}}",
                 Value::String(id.to_string()),
@@ -1312,76 +1297,389 @@ fn write_subagent_status(root: &Value) {
     }
 }
 
-fn build_subagent_content(task: &Value, session_effort: Option<&str>, columns: Option<i64>) -> Option<String> {
-    let mut colored: Vec<String> = Vec::new();
-    let mut plain: Vec<String> = Vec::new();
+fn current_time_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
 
-    if let Some(model) = get_string(task, "model").filter(|value| !value.is_empty()) {
-        let label = prettify_model(&clean_text(model));
-        colored.push(ansi("36", &label));
-        plain.push(label);
-    }
+/// サブエージェント1行は、メインの statusline と同じ Powerline セグメントで
+/// 組む。順序は モデル→Effort→コンテキスト→進捗→エージェント→ラベル で固定。
+/// 既知のEffort には本体と同じ段数ゲージを付ける。コンテキストの使用率バーは
+/// 細いステータスパネルで幅を使いすぎるため省く。
+fn build_subagent_content(
+    task: &Value,
+    session_effort: Option<&str>,
+    columns: Option<i64>,
+    now_ms: i64,
+) -> Option<String> {
+    let model = get_string(task, "model")
+        .filter(|value| !is_blank(value))
+        .map(|model| Segment {
+            background: MODEL_BACKGROUND,
+            foreground: WHITE,
+            text: format!(" {} ", prettify_model(&clean_text(model))),
+        });
 
-    if let Some(effort) = get_task_effort(task, session_effort) {
-        colored.push(ansi("35", &effort));
-        // 段階が既知のときだけゲージを添える。サブエージェントの effort は
-        // 数値のトークン予算でもありうるので、その場合は数値のまま出す。
-        if let Some(step) = get_effort_step(&effort) {
-            colored.push(build_effort_gauge(step, current_phase(), None));
-            plain.push(" ".repeat(EFFORT_GAUGE_WIDTH));
-        }
-        plain.push(effort);
-    }
+    // Effort セグメントの中身は本体の statusline と同じ `create_effort_text` に
+    // 任せる。既知の5段階ならゲージを添え、`EFFORT_BACKGROUND` を囲みの色として
+    // 渡すのでセグメント内で完結する。budget（数値のトークン予算）や未知の値は
+    // 段が定まらずゲージを出しようがないので、ラベルだけになる。
+    // ラベル文字列は削減カスケードでゲージ無しに作り直すために取っておく。
+    let effort_label = get_task_effort(task, session_effort);
+    let mut effort = effort_label.as_deref().map(|label| Segment {
+        background: EFFORT_BACKGROUND,
+        foreground: WHITE,
+        text: create_effort_text(label),
+    });
 
-    if let Some(token_count) = get_number(task, "tokenCount") {
-        let label = match get_number(task, "contextWindowSize").filter(|value| *value > 0.0) {
-            Some(context_size) => {
-                let displayed = round_half_away_from_zero(token_count / context_size * 100.0);
-                let label = format!(
-                    "{}/{} {}%",
-                    format_rounded_k(token_count),
-                    format_rounded_context(context_size),
-                    format_integer(displayed)
-                );
-                colored.push(ansi(percentage_color(displayed), &label));
-                label
-            }
-            None => {
-                let label = format_rounded_k(token_count);
-                colored.push(ansi("2", &label));
-                label
-            }
-        };
+    // コンテキストは常に出す。Effort と進捗のあいだに必ず挟まる面が無いと、
+    // `tokenCount` が欠けた入力では Effort と進捗が直接隣り合ってしまい、
+    // 両者の紫は色差 15.5 しかなく境界が見えなくなる（`adjacent_background_pairs`
+    // 参照）。取得できない場合はメインの statusline の `--%` 表示にならい、
+    // トークン数も使用率も無いことを ` -- ` で示す。
+    let token_count = get_number(task, "tokenCount");
+    let context = Some(match token_count {
+        Some(token_count) => build_context_segment(token_count, get_number(task, "contextWindowSize")),
+        None => Segment {
+            background: get_context_background(None),
+            foreground: DARK_TEXT,
+            text: " -- ".to_string(),
+        },
+    });
 
-        plain.push(label);
-    }
+    let mut elapsed = format_elapsed(get_number(task, "startTime"), now_ms);
+    let mut sparkline = build_sparkline(&get_number_array(task, "tokenSamples"));
+    let mut agent = get_agent_label(task).map(|label| Segment {
+        background: IDENTITY_BACKGROUND,
+        foreground: WHITE,
+        text: format!(" {} ", label),
+    });
+    let mut label = get_string(task, "label")
+        .filter(|value| !is_blank(value))
+        .or_else(|| get_string(task, "description").filter(|value| !is_blank(value)))
+        .map(clean_text)
+        .filter(|value| !is_blank(value));
 
-    if colored.is_empty() {
+    let mut progress = build_progress_segment(elapsed.as_deref(), sparkline.as_deref());
+
+    // コンテキストは上で常に `Some` にしているので、ここでは元データの有無
+    // （`tokenCount` が取れたかどうか）で判定する。
+    if model.is_none()
+        && effort.is_none()
+        && token_count.is_none()
+        && progress.is_none()
+        && agent.is_none()
+        && label.is_none()
+    {
         return None;
     }
 
-    let head_colored = colored.join(" ");
-    let head_plain = plain.join(" ");
-    let description = get_string(task, "description")
-        .or_else(|| get_string(task, "name"))
-        .map(clean_text)
-        .filter(|value| !value.is_empty());
+    let mut label_segment = build_label_segment(label.as_deref());
+    let budget = columns.unwrap_or(60) - 4;
 
-    let Some(mut description) = description else {
-        return Some(head_colored);
-    };
+    // 予算を超える場合はユーザー承認済みの順で削る:
+    // ゲージ → ラベルの切り詰め/削除 → スパークライン → エージェント →
+    // 経過時間（結果として進捗セグメントが空になれば削除） → Effort。
+    // モデルとコンテキストは常に残す。
 
-    let available = columns.unwrap_or(60) - head_plain.chars().count() as i64 - 3;
-    if available < 10 {
-        return Some(head_colored);
+    // ゲージを最初に落とすのは、段階名という情報そのものは残したまま
+    // 一度に11桁空くからで、ラベルを削るより失うものが小さい。
+    if subagent_width(&[&model, &effort, &context, &progress, &agent, &label_segment]) > budget {
+        if let (Some(segment), Some(label)) = (effort.as_mut(), effort_label.as_deref()) {
+            segment.text = format!(" {} ", label);
+        }
     }
 
-    if description.chars().count() as i64 > available {
-        let keep = (available - 3).max(0) as usize;
-        description = description.chars().take(keep).collect::<String>() + "...";
+    if subagent_width(&[&model, &effort, &context, &progress, &agent, &label_segment]) > budget {
+        let other_width = subagent_width(&[&model, &effort, &context, &progress, &agent]);
+        label = truncate_or_drop_label(label, other_width, budget);
+        label_segment = build_label_segment(label.as_deref());
     }
 
-    Some(head_colored + &ansi("2", &format!(" \u{b7} {}", description)))
+    if subagent_width(&[&model, &effort, &context, &progress, &agent, &label_segment]) > budget {
+        sparkline = None;
+        progress = build_progress_segment(elapsed.as_deref(), sparkline.as_deref());
+    }
+
+    if subagent_width(&[&model, &effort, &context, &progress, &agent, &label_segment]) > budget {
+        agent = None;
+    }
+
+    if subagent_width(&[&model, &effort, &context, &progress, &agent, &label_segment]) > budget {
+        elapsed = None;
+        progress = build_progress_segment(elapsed.as_deref(), sparkline.as_deref());
+    }
+
+    if subagent_width(&[&model, &effort, &context, &progress, &agent, &label_segment]) > budget {
+        effort = None;
+    }
+
+    let segments: Vec<Segment> = [model, effort, context, progress, agent, label_segment]
+        .into_iter()
+        .flatten()
+        .collect();
+
+    if segments.is_empty() {
+        None
+    } else {
+        Some(render_powerline(&segments))
+    }
+}
+
+/// Powerline の実表示幅は「各セグメントの表示幅の合計＋セグメント数」
+/// （セグメント間の楔 n-1 個＋末尾の楔1個）。ANSIエスケープは幅に数えない。
+/// 説明・ラベルには日本語が入りうるため、文字数ではなく表示幅で測る。
+fn subagent_width(pieces: &[&Option<Segment>]) -> i64 {
+    let mut text_len = 0i64;
+    let mut count = 0i64;
+    for piece in pieces {
+        if let Some(segment) = piece {
+            text_len += display_width(&strip_ansi(&segment.text));
+            count += 1;
+        }
+    }
+    text_len + count
+}
+
+/// ラベルは「他の全セグメント＋自分の楔＋前後の空白」を差し引いた残りに
+/// 収める。収まらないなら `...`（表示幅3）を付けて切り詰め、10桁未満しか
+/// 残らないなら（自明すぎて読めないので）セグメントごと落とす。
+fn truncate_or_drop_label(label: Option<String>, other_width: i64, budget: i64) -> Option<String> {
+    let label = label?;
+    let allowed_content = budget - other_width - 1 - 2;
+    if allowed_content < 10 {
+        return None;
+    }
+
+    if display_width(&label) <= allowed_content {
+        return Some(label);
+    }
+
+    Some(truncate_to_width(&label, allowed_content - 3) + "...")
+}
+
+/// 結合文字は表示幅0、東アジアの全角文字は表示幅2、それ以外は1として数える。
+/// 依存クレートを増やさないための最小限の自前実装。
+fn char_display_width(character: char) -> i64 {
+    let code = character as u32;
+
+    // 結合文字（結合分音記号）は単独では桁を持たない。
+    if (0x0300..=0x036F).contains(&code) {
+        return 0;
+    }
+
+    // East Asian Wide / Fullwidth の主要な範囲。U+2581–2588（スパークライン）
+    // は East Asian Ambiguous だがどの範囲にも含まれず、意図どおり1桁のまま
+    // 扱われる。
+    const WIDE_RANGES: [(u32, u32); 16] = [
+        (0x1100, 0x115F),
+        (0x2E80, 0x303E),
+        (0x3041, 0x33FF),
+        (0x3400, 0x4DBF),
+        (0x4E00, 0x9FFF),
+        (0xA000, 0xA4CF),
+        (0xAC00, 0xD7A3),
+        (0xF900, 0xFAFF),
+        (0xFE10, 0xFE19),
+        (0xFE30, 0xFE6F),
+        (0xFF00, 0xFF60),
+        (0xFFE0, 0xFFE6),
+        (0x1F300, 0x1F64F),
+        (0x1F900, 0x1F9FF),
+        (0x20000, 0x2FFFD),
+        (0x30000, 0x3FFFD),
+    ];
+
+    if WIDE_RANGES.iter().any(|&(start, end)| (start..=end).contains(&code)) {
+        2
+    } else {
+        1
+    }
+}
+
+fn display_width(text: &str) -> i64 {
+    text.chars().map(char_display_width).sum()
+}
+
+/// ANSI SGR エスケープ（`\x1b[...m`）を取り除き、目に見える文字だけ残す。
+fn strip_ansi(text: &str) -> String {
+    let mut result = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        result.push(character);
+    }
+    result
+}
+
+/// 表示幅が `max_width` に収まるところまで文字を残す。全角文字を割って
+/// 半端な1桁を残すことがないよう、次の1文字を足すと超える時点で止める。
+fn truncate_to_width(text: &str, max_width: i64) -> String {
+    let mut result = String::new();
+    let mut width = 0i64;
+    for character in text.chars() {
+        let character_width = char_display_width(character);
+        if width + character_width > max_width {
+            break;
+        }
+        width += character_width;
+        result.push(character);
+    }
+    result
+}
+
+fn build_context_segment(token_count: f64, context_window_size: Option<f64>) -> Segment {
+    match context_window_size.filter(|value| *value > 0.0) {
+        Some(context_size) => {
+            let displayed = round_half_away_from_zero(token_count / context_size * 100.0);
+            Segment {
+                background: get_context_background(Some(displayed)),
+                foreground: DARK_TEXT,
+                text: format!(
+                    " {}/{} {}% ",
+                    format_rounded_k(token_count),
+                    format_rounded_context(context_size),
+                    format_integer(displayed)
+                ),
+                }
+        }
+        // 上限が無ければ使用率は出しようがないので、トークン数だけ見せる。
+        None => Segment {
+            background: get_context_background(None),
+            foreground: DARK_TEXT,
+            text: format!(" {} ", format_rounded_k(token_count)),
+        },
+    }
+}
+
+fn build_progress_segment(elapsed: Option<&str>, sparkline: Option<&str>) -> Option<Segment> {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(elapsed) = elapsed {
+        parts.push(elapsed);
+    }
+    if let Some(sparkline) = sparkline {
+        parts.push(sparkline);
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    Some(Segment {
+        background: WORKTREE_BACKGROUND,
+        foreground: WHITE,
+        text: format!(" {} ", parts.join(" ")),
+    })
+}
+
+fn build_label_segment(label: Option<&str>) -> Option<Segment> {
+    label.map(|label| Segment {
+        background: COST_BACKGROUND,
+        foreground: DARK_TEXT,
+        text: format!(" {} ", label),
+    })
+}
+
+/// `startTime` はエポック秒・ミリ秒のどちらでも渡されうる。現実的な日時なら
+/// 秒表記は13桁未満、ミリ秒表記は13桁以上になるので、1e12 を境に振り分けて
+/// 正規化する。
+fn normalize_start_time_ms(value: f64) -> f64 {
+    if value.abs() < 1e12 {
+        value * 1000.0
+    } else {
+        value
+    }
+}
+
+/// 経過時間の表示。`startTime` が未来・欠落・不正なら None を返し、
+/// 進捗セグメントからその部分だけを省く。
+fn format_elapsed(start_time: Option<f64>, now_ms: i64) -> Option<String> {
+    let start_time = start_time.filter(|value| value.is_finite())?;
+    let elapsed_ms = now_ms as f64 - normalize_start_time_ms(start_time);
+    if elapsed_ms < 0.0 {
+        return None;
+    }
+
+    Some(format_duration((elapsed_ms / 1000.0) as i64))
+}
+
+/// 2単位までの経過表示。`1h02m` / `2m14s` / `47s`。
+fn format_duration(total_seconds: i64) -> String {
+    let total_seconds = total_seconds.max(0);
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    if hours > 0 {
+        format!("{}h{:02}m", hours, minutes)
+    } else if minutes > 0 {
+        format!("{}m{:02}s", minutes, seconds)
+    } else {
+        format!("{}s", seconds)
+    }
+}
+
+const SPARKLINE_LEVELS: [char; 8] =
+    ['\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+
+/// `tokenSamples` にはタイムスタンプが無いので、毎秒のレートは絶対に出せない。
+/// 隣接差分だけを8段階に量子化する。差分の最大値を上限に正規化し、
+/// 全差分が0（またはサンプルが減少方向のみ）なら最低段を並べる。
+fn build_sparkline(samples: &[f64]) -> Option<String> {
+    if samples.len() < 2 {
+        return None;
+    }
+
+    let diffs: Vec<f64> = samples.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    let max_diff = diffs.iter().copied().fold(0.0, f64::max);
+
+    let mut sparkline = String::new();
+    for diff in diffs {
+        let index = if max_diff <= 0.0 {
+            0
+        } else {
+            let ratio = (diff / max_diff).clamp(0.0, 1.0);
+            (ratio * (SPARKLINE_LEVELS.len() - 1) as f64).round() as usize
+        };
+        sparkline.push(SPARKLINE_LEVELS[index.min(SPARKLINE_LEVELS.len() - 1)]);
+    }
+
+    Some(sparkline)
+}
+
+fn get_number_array(element: &Value, property_name: &str) -> Vec<f64> {
+    element
+        .as_object()
+        .and_then(|object| object.get(property_name))
+        .and_then(Value::as_array)
+        .map(|array| array.iter().filter_map(Value::as_f64).collect())
+        .unwrap_or_default()
+}
+
+/// `name` があればそれを使う。無ければ `type` を短縮ラベルへ変換するが、
+/// `local_agent` は名乗りようがないので省略する。未知の `type` も安全側で省略。
+fn get_agent_label(task: &Value) -> Option<String> {
+    if let Some(name) = get_string(task, "name").filter(|value| !is_blank(value)) {
+        return Some(clean_text(name));
+    }
+
+    match get_string(task, "type")? {
+        "local_bash" => Some("bash".to_string()),
+        "local_workflow" => Some("workflow".to_string()),
+        "remote_agent" => Some("remote".to_string()),
+        "in_process_teammate" => Some("teammate".to_string()),
+        _ => None,
+    }
 }
 
 fn get_task_effort(task: &Value, session_effort: Option<&str>) -> Option<String> {
@@ -1449,16 +1747,6 @@ fn strip_date_suffix(text: &str) -> &str {
         &text[..index]
     } else {
         text
-    }
-}
-
-fn percentage_color(displayed_percentage: f64) -> &'static str {
-    if displayed_percentage >= 90.0 {
-        "31"
-    } else if displayed_percentage >= 70.0 {
-        "33"
-    } else {
-        "36"
     }
 }
 
@@ -1608,6 +1896,26 @@ mod tests {
             pairs.push((format!("7d[{index}] → cost"), light, COST_BACKGROUND));
         }
 
+        // --- サブエージェント行（モデル→Effort→コンテキスト→進捗→エージェント→ラベル） ---
+        // モデルは省略されうるが、コンテキストは `build_subagent_content` が
+        // `tokenCount` の有無にかかわらず必ず1つ出す（取れなければ ` -- `）。
+        // Effort・進捗・エージェント・ラベルは省略されうるので、コンテキストを
+        // 飛び越した隣接（モデル→コンテキスト、コンテキスト→エージェント／
+        // ラベル）が生じる。一方 Effort は必ずコンテキストの直前にしか置かれ
+        // ないため、コンテキストを飛び越して進捗以降に隣り合うことはない
+        // （両方とも紫系で、隣り合うと色差15.5しかなく境界が消える）。
+        // `model → effort` と `effort → context[*]` は上のメイン行と同じ
+        // 色の組み合わせなので、そちらのテストで既にカバーされている。
+        for (index, context) in CONTEXT_BANDS.into_iter().enumerate() {
+            pairs.push((format!("model → context[{index}]"), MODEL_BACKGROUND, context));
+            pairs.push((format!("context[{index}] → progress"), context, WORKTREE_BACKGROUND));
+            pairs.push((format!("context[{index}] → agent"), context, IDENTITY_BACKGROUND));
+            pairs.push((format!("context[{index}] → label"), context, COST_BACKGROUND));
+        }
+        pairs.push(("progress → agent".to_string(), WORKTREE_BACKGROUND, IDENTITY_BACKGROUND));
+        pairs.push(("progress → label".to_string(), WORKTREE_BACKGROUND, COST_BACKGROUND));
+        pairs.push(("agent → label".to_string(), IDENTITY_BACKGROUND, COST_BACKGROUND));
+
         pairs
     }
 
@@ -1638,6 +1946,11 @@ mod tests {
             ("worktree", WORKTREE_BACKGROUND, WHITE),
             ("diff", DIFF_BACKGROUND, DARK_TEXT),
             ("cost", COST_BACKGROUND, DARK_TEXT),
+            // サブエージェント行の進捗・エージェント・ラベルは上と同じ配色を
+            // 再利用しているだけだが、その事実を明示するために別名でも足す。
+            ("subagent progress", WORKTREE_BACKGROUND, WHITE),
+            ("subagent agent", IDENTITY_BACKGROUND, WHITE),
+            ("subagent label", COST_BACKGROUND, DARK_TEXT),
         ];
         for context in CONTEXT_BANDS {
             pairs.push(("context", context, DARK_TEXT));
@@ -1655,30 +1968,67 @@ mod tests {
         }
     }
 
-    /// どの段階・どのコマでも5段が描かれ、段階の範囲内の段と範囲外の段の数が
-    /// 一致すること。区切りは「5段ぶん＋ゲージを閉じるぶん」で6個になる。
+    /// 既知の各段階は、上の段も黒い空セルとして残した5セルのゲージになること。
     #[test]
-    fn effort_gauge_always_shows_five_steps() {
+    fn effort_gauge_always_shows_five_cells() {
         for step in 1..=EFFORT_STEPS {
             for phase in 0..step + 1 + EFFORT_HOLD_FRAMES {
                 let gauge = build_effort_gauge(step, phase, Some(EFFORT_BACKGROUND));
+                let ordinary = gauge.matches(POWERLINE_RIGHT).count();
+                let thin = gauge.matches(POWERLINE_RIGHT_THIN).count();
 
-                let separators = gauge.matches(POWERLINE_RIGHT).count()
-                    + gauge.matches(POWERLINE_RIGHT_THIN).count();
-                assert_eq!(separators, EFFORT_STEPS + 1, "step {step} phase {phase}: 区切りの数");
-
+                assert_eq!(gauge.matches(' ').count(), EFFORT_STEPS, "step {step} phase {phase}: セル数");
+                assert_eq!(ordinary + thin, EFFORT_STEPS + 1, "step {step} phase {phase}: 境界の数");
                 assert_eq!(
-                    gauge.matches(' ').count(),
-                    step,
-                    "step {step} phase {phase}: 段階の範囲内の段の数"
+                    thin,
+                    EFFORT_STEPS.saturating_sub(step + 1),
+                    "step {step} phase {phase}: 同色の空セル境界"
+                );
+                assert!(
+                    !gauge.contains('\u{2591}'),
+                    "step {step} phase {phase}: 空セルに点字プレースホルダーがある"
                 );
                 assert_eq!(
-                    gauge.matches('\u{2591}').count(),
+                    gauge.matches(&background(EFFORT_EMPTY_BACKGROUND)).count(),
                     EFFORT_STEPS - step,
-                    "step {step} phase {phase}: 段階の範囲外の段の数"
+                    "step {step} phase {phase}: 黒い空セルの数"
                 );
             }
         }
+    }
+
+    /// High は紫の3セルと、文字を置かない黒い2セルを持つ。黒セルどうしは
+    /// 同じ黒地のまま細い楔で区切り、最後はEffort地へ正しく戻ること。
+    #[test]
+    fn high_effort_has_three_coloured_and_two_black_blank_cells() {
+        let gauge = build_effort_gauge(3, 3, Some(EFFORT_BACKGROUND));
+        let expected = format!(
+            "{}{}{} {}{}{} {}{}{} {}{}{} {}{}{} {}{}{}{}",
+            foreground(EFFORT_BACKGROUND),
+            background(EFFORT_LIT_BACKGROUNDS[0]),
+            POWERLINE_RIGHT,
+            foreground(EFFORT_LIT_BACKGROUNDS[0]),
+            background(EFFORT_LIT_BACKGROUNDS[1]),
+            POWERLINE_RIGHT,
+            foreground(EFFORT_LIT_BACKGROUNDS[1]),
+            background(EFFORT_LIT_BACKGROUNDS[2]),
+            POWERLINE_RIGHT,
+            foreground(EFFORT_LIT_BACKGROUNDS[2]),
+            background(EFFORT_EMPTY_BACKGROUND),
+            POWERLINE_RIGHT,
+            foreground(EFFORT_EMPTY_DIVIDER),
+            background(EFFORT_EMPTY_BACKGROUND),
+            POWERLINE_RIGHT_THIN,
+            foreground(EFFORT_EMPTY_BACKGROUND),
+            background(EFFORT_BACKGROUND),
+            POWERLINE_RIGHT,
+            foreground(WHITE),
+        );
+
+        assert_eq!(gauge, expected);
+        assert_eq!(gauge.matches(' ').count(), 5);
+        assert_eq!(gauge.matches(&background(EFFORT_EMPTY_BACKGROUND)).count(), 2);
+        assert!(!gauge.contains('\u{2591}'));
     }
 
     /// アニメーションは現在の段階まで1段ずつ満ちていき、そこで止まること。
@@ -1804,11 +2154,14 @@ mod tests {
             assert!(difference >= 8.0, "{label}: 色差 {difference:.1}");
         }
 
-        let divider = contrast_ratio(EFFORT_EMPTY_DIVIDER, EFFORT_EMPTY_BACKGROUND);
-        assert!(divider >= 2.0, "細区切りのコントラスト比 {divider:.2}");
+        let ending = contrast_ratio(EFFORT_EMPTY_BACKGROUND, EFFORT_BACKGROUND);
+        assert!(ending >= 2.0, "未到達を示す終端のコントラスト比 {ending:.2}");
 
-        let glyph = contrast_ratio(EFFORT_EMPTY_FOREGROUND, EFFORT_EMPTY_BACKGROUND);
-        assert!(glyph >= 2.0, "未点灯の記号のコントラスト比 {glyph:.2}");
+        let empty_divider = contrast_ratio(EFFORT_EMPTY_DIVIDER, EFFORT_EMPTY_BACKGROUND);
+        assert!(
+            empty_divider >= 2.0,
+            "同色の空セルを区切る細い楔のコントラスト比 {empty_divider:.2}"
+        );
     }
 
     /// 段が上がるほど明るくなること。点灯・待機のどちらの並びでも保つ。
@@ -1826,23 +2179,25 @@ mod tests {
         }
     }
 
-    /// サブエージェント行は Powerline セグメントの中ではなく端末の地の上に
-    /// 描く。外側の背景色が分からないので先頭の楔は描かず、幅は段5つ＋区切り
-    /// 5つの10桁になる。説明文の切り詰め計算がこの幅に依存している。
+    /// 端末の地へ直接描く場合も、外側の先頭楔を除いて5セルを残すこと。
     #[test]
-    fn effort_gauge_on_terminal_ground_has_a_known_width() {
+    fn effort_gauge_on_terminal_ground_always_has_five_cells() {
         for step in 1..=EFFORT_STEPS {
             for phase in 0..step + 1 + EFFORT_HOLD_FRAMES {
                 let gauge = build_effort_gauge(step, phase, None);
 
                 let separators = gauge.matches(POWERLINE_RIGHT).count()
                     + gauge.matches(POWERLINE_RIGHT_THIN).count();
-                let bodies = gauge.matches(' ').count() + gauge.matches('\u{2591}').count();
-                assert_eq!(bodies, EFFORT_STEPS, "step {step} phase {phase}: 段の数");
+                let bodies = gauge.matches(' ').count();
+                assert_eq!(bodies, EFFORT_STEPS, "step {step} phase {phase}: セル数");
                 assert_eq!(
                     separators + bodies,
-                    EFFORT_GAUGE_WIDTH,
+                    EFFORT_STEPS * 2,
                     "step {step} phase {phase}: 表示幅"
+                );
+                assert!(
+                    !gauge.contains('\u{2591}'),
+                    "step {step} phase {phase}: 点字プレースホルダーがある"
                 );
 
                 // 装飾を残したまま行の続きへ抜けると、後ろの文字まで着色される。
@@ -1862,15 +2217,25 @@ mod tests {
             "id": "a", "model": "claude-opus-5", "effort": "high",
             "tokenCount": 45231, "contextWindowSize": 200000
         });
-        let content = build_subagent_content(&named, None, Some(120)).expect("行が出ない");
-        assert!(content.contains(POWERLINE_RIGHT), "既知の段階にゲージが出ていない");
+        let content = build_subagent_content(&named, None, Some(120), 0).expect("行が出ない");
+        assert_eq!(content.matches(POWERLINE_RIGHT).count(), 8, "通常の楔の数");
+        assert_eq!(content.matches(POWERLINE_RIGHT_THIN).count(), 1, "黒セル間の細い楔");
+        assert_eq!(
+            content.matches(POWERLINE_RIGHT).count() + content.matches(POWERLINE_RIGHT_THIN).count(),
+            9,
+            "モデル・Highの5セル・コンテキストの境界"
+        );
 
         let budget = serde_json::json!({
             "id": "b", "model": "claude-opus-5", "effort": 12000,
             "tokenCount": 8000, "contextWindowSize": 200000
         });
-        let content = build_subagent_content(&budget, None, Some(120)).expect("行が出ない");
-        assert!(!content.contains(POWERLINE_RIGHT), "数値予算にゲージが出ている");
+        let content = build_subagent_content(&budget, None, Some(120), 0).expect("行が出ない");
+        assert_eq!(
+            content.matches(POWERLINE_RIGHT).count(),
+            3,
+            "数値予算に段数ゲージが出ている"
+        );
         assert!(content.contains("12k"), "数値予算が出ていない");
     }
 
@@ -1933,5 +2298,415 @@ mod tests {
 
         let empty = contrast_ratio(BAR_EMPTY_FOREGROUND, BAR_TRACK_BACKGROUND);
         assert!(empty >= 1.8, "未使用部分のコントラスト比 {empty:.2}");
+    }
+
+    // ------------------------------------------------------------- --subagent
+
+    const SUBAGENT_NOW_MS: i64 = 1_700_000_000_000;
+
+    /// 全フィールドが揃ったタスク。`startTime` は `SUBAGENT_NOW_MS` から
+    /// 134秒（2分14秒）前、`tokenSamples` は差分1つが最大値になるよう
+    /// 2件だけにしてスパークラインを1文字に固定している。ラベルは30文字の
+    /// ASCIIにして、削減段階ごとの幅を手計算で追えるようにしている。
+    fn cascade_task(now_ms: i64) -> Value {
+        serde_json::json!({
+            "model": "claude-sonnet-5",
+            "effort": "xhigh",
+            "tokenCount": 63000.0,
+            "contextWindowSize": 1_000_000.0,
+            "startTime": (now_ms - 134_000) as f64,
+            "tokenSamples": [0.0, 100.0],
+            "name": "Bot",
+            "type": "local_agent",
+            "label": "x".repeat(30),
+        })
+    }
+
+    /// 予算に十分余裕があれば何も削られないこと。
+    #[test]
+    fn subagent_content_shows_everything_when_it_fits() {
+        let task = cascade_task(SUBAGENT_NOW_MS);
+        let content = build_subagent_content(&task, None, Some(96), SUBAGENT_NOW_MS)
+            .expect("全フィールドがあるので出る");
+
+        assert!(content.contains("Sonnet 5"), "モデル: {content}");
+        assert!(content.contains("Xhigh"), "Effort: {content}");
+        assert!(
+            content.contains(&background(EFFORT_EMPTY_BACKGROUND)),
+            "余裕があればゲージも出る: {content}"
+        );
+        assert!(content.contains("63k/1M 6%"), "コンテキスト: {content}");
+        assert!(content.contains("2m14s"), "経過時間: {content}");
+        assert!(content.contains('\u{2588}'), "スパークライン: {content}");
+        assert!(content.contains("Bot"), "エージェント名: {content}");
+        assert_eq!(content.matches('x').count(), 30, "ラベルが切り詰められていない: {content}");
+        assert!(!content.contains("..."), "ラベルが切り詰められていない: {content}");
+    }
+
+    /// 削減の第1段階: ゲージだけを落として段階名の文字に戻す。
+    /// 段階という情報は残したまま一度に12桁空くので、ラベルより先に譲る。
+    #[test]
+    fn subagent_content_drops_the_gauge_before_the_label() {
+        let task = cascade_task(SUBAGENT_NOW_MS);
+        let content = build_subagent_content(&task, None, Some(95), SUBAGENT_NOW_MS).unwrap();
+
+        // ゲージの空セルの黒地は、ゲージが描かれたときにしか現れない。
+        assert!(
+            !content.contains(&background(EFFORT_EMPTY_BACKGROUND)),
+            "ゲージが消える: {content}"
+        );
+        assert!(content.contains("Xhigh"), "段階名は残る: {content}");
+        assert!(!content.contains("..."), "ラベルはまだ切り詰めない: {content}");
+        assert_eq!(content.matches('x').count(), 30, "ラベルは丸ごと残る: {content}");
+        assert!(content.contains("2m14s") && content.contains('\u{2588}') && content.contains("Bot"));
+    }
+
+    /// 第2段階: ゲージを落としても収まらないので、ラベルを `...` 付きで切り詰める。
+    #[test]
+    fn subagent_content_truncates_label_before_dropping_anything_else() {
+        let task = cascade_task(SUBAGENT_NOW_MS);
+        let content = build_subagent_content(&task, None, Some(83), SUBAGENT_NOW_MS).unwrap();
+
+        assert!(content.contains("..."), "{content}");
+        assert_eq!(content.matches('x').count(), 26, "切り詰め後に残る文字数: {content}");
+        assert!(content.contains("Sonnet 5") && content.contains("Xhigh") && content.contains("63k/1M 6%"));
+        assert!(content.contains("2m14s") && content.contains('\u{2588}') && content.contains("Bot"));
+    }
+
+    /// 第3段階: 切り詰めても10文字未満しか残らないので、ラベルごと消える。
+    #[test]
+    fn subagent_content_drops_label_before_sparkline() {
+        let task = cascade_task(SUBAGENT_NOW_MS);
+        let content = build_subagent_content(&task, None, Some(63), SUBAGENT_NOW_MS).unwrap();
+
+        assert!(!content.contains("..."), "{content}");
+        assert_eq!(content.matches('x').count(), 0, "ラベルが完全に消える: {content}");
+        assert!(content.contains('\u{2588}'), "スパークラインはまだ残る: {content}");
+        assert!(content.contains("Bot") && content.contains("2m14s") && content.contains("Xhigh"));
+    }
+
+    /// 第4段階: ラベルを消しても収まらないので、次はスパークラインを落とす。
+    #[test]
+    fn subagent_content_drops_sparkline_before_agent() {
+        let task = cascade_task(SUBAGENT_NOW_MS);
+        let content = build_subagent_content(&task, None, Some(50), SUBAGENT_NOW_MS).unwrap();
+
+        assert!(!content.contains('\u{2588}'), "スパークラインが消える: {content}");
+        assert!(content.contains("Bot"), "エージェントはまだ残る: {content}");
+        assert!(content.contains("2m14s") && content.contains("Xhigh"));
+    }
+
+    /// 第5段階: 次はエージェントセグメントを落とす。
+    #[test]
+    fn subagent_content_drops_agent_before_elapsed() {
+        let task = cascade_task(SUBAGENT_NOW_MS);
+        let content = build_subagent_content(&task, None, Some(48), SUBAGENT_NOW_MS).unwrap();
+
+        assert!(!content.contains("Bot"), "エージェントが消える: {content}");
+        assert!(content.contains("2m14s"), "経過時間はまだ残る: {content}");
+        assert!(content.contains("Xhigh"));
+    }
+
+    /// 第6段階: 次は経過時間を落とす。結果として進捗セグメントごと消える。
+    #[test]
+    fn subagent_content_drops_elapsed_before_effort() {
+        let task = cascade_task(SUBAGENT_NOW_MS);
+        let content = build_subagent_content(&task, None, Some(42), SUBAGENT_NOW_MS).unwrap();
+
+        assert!(!content.contains("2m14s"), "経過時間が消える: {content}");
+        assert!(content.contains("Xhigh"), "Effortはまだ残る: {content}");
+        assert!(content.contains("Sonnet 5") && content.contains("63k/1M 6%"));
+    }
+
+    /// 第7段階: 最後にEffortを落とす。
+    #[test]
+    fn subagent_content_drops_effort_last() {
+        let task = cascade_task(SUBAGENT_NOW_MS);
+        let content = build_subagent_content(&task, None, Some(29), SUBAGENT_NOW_MS).unwrap();
+
+        assert!(!content.contains("Xhigh"), "Effortが消える: {content}");
+        assert!(content.contains("Sonnet 5") && content.contains("63k/1M 6%"), "{content}");
+    }
+
+    /// モデルとコンテキストはどれだけ狭くても残る。
+    #[test]
+    fn subagent_content_always_keeps_model_and_context() {
+        let task = cascade_task(SUBAGENT_NOW_MS);
+        let content = build_subagent_content(&task, None, Some(10), SUBAGENT_NOW_MS).unwrap();
+
+        assert!(
+            content.contains("Sonnet 5") && content.contains("63k/1M 6%"),
+            "極端に狭くてもモデルとコンテキストは残る: {content}"
+        );
+    }
+
+    #[test]
+    fn context_segment_shows_percentage_with_window_size() {
+        let segment = build_context_segment(63000.0, Some(1_000_000.0));
+        assert_eq!(segment.text, " 63k/1M 6% ");
+    }
+
+    /// 上限が無ければ使用率は出しようがないので、トークン数だけになる。
+    #[test]
+    fn context_segment_omits_percentage_without_window_size() {
+        let segment = build_context_segment(63000.0, None);
+        assert_eq!(segment.text, " 63k ");
+    }
+
+    #[test]
+    fn agent_label_prefers_name_then_falls_back_to_type() {
+        let cases = [
+            (serde_json::json!({"name": "Explorer", "type": "local_agent"}), Some("Explorer")),
+            (serde_json::json!({"type": "local_agent"}), None),
+            (serde_json::json!({"type": "local_bash"}), Some("bash")),
+            (serde_json::json!({"type": "local_workflow"}), Some("workflow")),
+            (serde_json::json!({"type": "remote_agent"}), Some("remote")),
+            (serde_json::json!({"type": "in_process_teammate"}), Some("teammate")),
+            (serde_json::json!({"type": "unknown_type"}), None),
+            (serde_json::json!({}), None),
+        ];
+        for (task, expected) in cases {
+            assert_eq!(get_agent_label(&task).as_deref(), expected, "{task:?}");
+        }
+    }
+
+    #[test]
+    fn sparkline_handles_short_sample_lists() {
+        assert_eq!(build_sparkline(&[]), None, "0件");
+        assert_eq!(build_sparkline(&[42.0]), None, "1件");
+    }
+
+    /// 差分が全て0（または減少方向のみ）なら、最低段が並ぶだけで壊れない。
+    #[test]
+    fn sparkline_uses_lowest_level_when_flat_or_decreasing() {
+        let flat = build_sparkline(&[100.0, 100.0, 100.0]).expect("2件以上なので出るはず");
+        assert_eq!(flat, "\u{2581}\u{2581}");
+
+        let decreasing = build_sparkline(&[100.0, 50.0, 10.0]).expect("2件以上なので出るはず");
+        assert_eq!(decreasing, "\u{2581}\u{2581}", "減少方向のみなら最低段が並ぶ");
+    }
+
+    #[test]
+    fn format_elapsed_normalizes_seconds_and_millis_the_same_way() {
+        let millis = format_elapsed(Some((SUBAGENT_NOW_MS - 130_000) as f64), SUBAGENT_NOW_MS);
+        assert_eq!(millis.as_deref(), Some("2m10s"));
+
+        // 同じ瞬間を秒表記で渡しても同じ結果になること。
+        let seconds = format_elapsed(Some(((SUBAGENT_NOW_MS - 130_000) / 1000) as f64), SUBAGENT_NOW_MS);
+        assert_eq!(seconds.as_deref(), Some("2m10s"));
+    }
+
+    /// `startTime` が未来・欠落・不正なら、経過部分は静かに省かれる。
+    #[test]
+    fn format_elapsed_omits_future_missing_and_invalid_start_time() {
+        assert_eq!(format_elapsed(Some((SUBAGENT_NOW_MS + 5_000) as f64), SUBAGENT_NOW_MS), None, "未来");
+        assert_eq!(format_elapsed(None, SUBAGENT_NOW_MS), None, "欠落");
+        assert_eq!(format_elapsed(Some(f64::NAN), SUBAGENT_NOW_MS), None, "不正");
+    }
+
+    /// `tokenSamples` が0件・1件・全差分0でも `build_subagent_content` が
+    /// パニックせず、それぞれ妥当な形で出ること。
+    #[test]
+    fn subagent_content_survives_short_and_flat_token_samples() {
+        let empty_samples =
+            serde_json::json!({"model": "claude-sonnet-5", "tokenCount": 1000.0, "tokenSamples": []});
+        assert!(build_subagent_content(&empty_samples, None, Some(120), SUBAGENT_NOW_MS).is_some());
+
+        let one_sample =
+            serde_json::json!({"model": "claude-sonnet-5", "tokenCount": 1000.0, "tokenSamples": [5.0]});
+        assert!(build_subagent_content(&one_sample, None, Some(120), SUBAGENT_NOW_MS).is_some());
+
+        let flat_samples = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "tokenCount": 1000.0,
+            "tokenSamples": [5.0, 5.0, 5.0],
+        });
+        let content = build_subagent_content(&flat_samples, None, Some(120), SUBAGENT_NOW_MS).unwrap();
+        assert!(content.contains('\u{2581}'), "差分が全て0なら最低段のスパークラインになる: {content}");
+    }
+
+    /// `startTime` が秒・ミリ秒・未来・欠落のどれでも `build_subagent_content`
+    /// がパニックしないこと。
+    #[test]
+    fn subagent_content_survives_second_and_millisecond_start_times() {
+        let millis_task = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "tokenCount": 1000.0,
+            "startTime": (SUBAGENT_NOW_MS - 47_000) as f64,
+        });
+        let millis_content =
+            build_subagent_content(&millis_task, None, Some(120), SUBAGENT_NOW_MS).unwrap();
+        assert!(millis_content.contains("47s"), "{millis_content}");
+
+        let seconds_task = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "tokenCount": 1000.0,
+            "startTime": ((SUBAGENT_NOW_MS - 47_000) / 1000) as f64,
+        });
+        let seconds_content =
+            build_subagent_content(&seconds_task, None, Some(120), SUBAGENT_NOW_MS).unwrap();
+        assert!(seconds_content.contains("47s"), "{seconds_content}");
+
+        let future_task = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "tokenCount": 1000.0,
+            "startTime": (SUBAGENT_NOW_MS + 10_000) as f64,
+        });
+        let future_content =
+            build_subagent_content(&future_task, None, Some(120), SUBAGENT_NOW_MS).unwrap();
+        assert!(!future_content.contains('s'), "未来のstartTimeは経過を含まない: {future_content}");
+
+        let missing_task = serde_json::json!({"model": "claude-sonnet-5", "tokenCount": 1000.0});
+        let missing_content =
+            build_subagent_content(&missing_task, None, Some(120), SUBAGENT_NOW_MS).unwrap();
+        assert!(!missing_content.contains('s'), "startTime欠落時は経過を含まない: {missing_content}");
+    }
+
+    /// `tasks` 相当の単体（空オブジェクト、`model` 等が全欠落）では、
+    /// 従来どおり行そのものを出さない。
+    #[test]
+    fn subagent_content_omits_line_when_everything_is_missing() {
+        assert_eq!(build_subagent_content(&serde_json::json!({}), None, Some(80), SUBAGENT_NOW_MS), None);
+        assert_eq!(
+            build_subagent_content(
+                &serde_json::json!({"type": "local_agent"}),
+                None,
+                None,
+                SUBAGENT_NOW_MS
+            ),
+            None,
+            "nameの無いlocal_agentは名乗れないので何も出さない"
+        );
+    }
+
+    /// `tokenCount` が取れなくても、他に出すものがあれば行は出す。コンテキスト
+    /// セグメントは ` -- ` になる（Effort と進捗の間を必ず埋めるため）。
+    #[test]
+    fn subagent_content_shows_dash_context_when_token_count_is_missing() {
+        let task = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "effort": "high",
+            "name": "Bot",
+            "label": "waiting",
+        });
+        let content = build_subagent_content(&task, None, Some(120), SUBAGENT_NOW_MS)
+            .expect("tokenCountが無くても他のフィールドがあれば行を出す");
+        assert!(content.contains(" -- "), "{content}");
+    }
+
+    /// フル装備のタスクから `tokenCount` だけを抜いたケース。他は全部揃って
+    /// いるので、コンテキストだけが ` -- ` になり、行自体は変わらず出る。
+    #[test]
+    fn subagent_content_shows_dash_context_when_only_token_count_is_missing() {
+        let mut task = cascade_task(SUBAGENT_NOW_MS);
+        task.as_object_mut().expect("object").remove("tokenCount");
+
+        let content = build_subagent_content(&task, None, Some(120), SUBAGENT_NOW_MS).unwrap();
+        assert!(content.contains(" -- "), "{content}");
+        assert!(content.contains("Sonnet 5") && content.contains("Xhigh") && content.contains("Bot"));
+    }
+
+    // --------------------------------------------------------- 表示幅（全角）
+
+    #[test]
+    fn display_width_treats_combining_marks_as_zero_width() {
+        assert_eq!(display_width("e\u{0301}"), 1, "eに結合アクセントを足しても1桁");
+    }
+
+    #[test]
+    fn display_width_treats_cjk_as_two_columns() {
+        assert_eq!(display_width("警告"), 4);
+        assert_eq!(display_width("ABC"), 3);
+        assert_eq!(display_width("A警B"), 4, "半角と全角の混在");
+    }
+
+    /// スパークラインは East Asian Ambiguous だが、現代の端末では1桁で
+    /// 描かれるので、全角扱いにしてはならない。
+    #[test]
+    fn display_width_keeps_sparkline_glyphs_at_one_column() {
+        let spark = "\u{2581}\u{2582}\u{2583}\u{2584}\u{2585}\u{2586}\u{2587}\u{2588}";
+        assert_eq!(display_width(spark), 8);
+    }
+
+    /// 全角文字の途中で1桁だけ余っても、そこでは切らない。
+    #[test]
+    fn truncate_to_width_never_splits_a_wide_character() {
+        assert_eq!(truncate_to_width("警告表示", 5), "警告", "5桁では2文字目までしか入らない");
+        assert_eq!(truncate_to_width("警告表示", 4), "警告");
+        assert_eq!(truncate_to_width("警告表示", 3), "警", "3桁では1文字しか入らない");
+        assert_eq!(truncate_to_width("ABCDE", 3), "ABC", "半角なら文字数どおり");
+    }
+
+    /// 全角ラベルでも、`columns` を絞ったときに実際の表示幅が必ず予算以下に
+    /// なること。ANSIエスケープを取り除いた上で `display_width` を掛けて
+    /// 確かめる（Powerlineの楔もこの中で1桁として数えている）。
+    #[test]
+    fn subagent_content_respects_budget_with_wide_label() {
+        for columns in [300, 150, 100, 90, 84, 80, 74, 70, 65, 60, 55, 50, 45, 40, 35, 30] {
+            let task = serde_json::json!({
+                "model": "claude-sonnet-5",
+                "effort": "xhigh",
+                "tokenCount": 63000.0,
+                "contextWindowSize": 1_000_000.0,
+                "startTime": (SUBAGENT_NOW_MS - 134_000) as f64,
+                "tokenSamples": [0.0, 100.0],
+                "name": "探索エージェント",
+                "type": "local_agent",
+                "label": "警告表示を各セクションに適用する処理を確認しています",
+            });
+            let Some(content) = build_subagent_content(&task, None, Some(columns), SUBAGENT_NOW_MS) else {
+                continue;
+            };
+
+            let budget = columns - 4;
+            let visible_width = display_width(&strip_ansi(&content));
+            assert!(
+                visible_width <= budget,
+                "columns={columns}: 表示幅{visible_width}が予算{budget}を超えている: {content}"
+            );
+        }
+    }
+
+    /// 全角＋半角混在のラベルでも同様に予算内へ収まること。
+    #[test]
+    fn subagent_content_respects_budget_with_mixed_width_label() {
+        for columns in [300, 150, 100, 90, 84, 80, 74, 70, 65, 60, 55, 50, 45, 40, 35, 30] {
+            let task = serde_json::json!({
+                "model": "claude-sonnet-5",
+                "effort": "high",
+                "tokenCount": 12000.0,
+                "contextWindowSize": 200_000.0,
+                "name": "Agent警告",
+                "label": "src/main.rsを読んでいます (line 1234)",
+            });
+            let Some(content) = build_subagent_content(&task, None, Some(columns), SUBAGENT_NOW_MS) else {
+                continue;
+            };
+
+            let budget = columns - 4;
+            let visible_width = display_width(&strip_ansi(&content));
+            assert!(
+                visible_width <= budget,
+                "columns={columns}: 表示幅{visible_width}が予算{budget}を超えている: {content}"
+            );
+        }
+    }
+
+    /// ASCIIのみのラベルでも従来どおり予算内へ収まること（回帰確認）。
+    #[test]
+    fn subagent_content_respects_budget_with_ascii_only_label() {
+        for columns in [300, 150, 100, 90, 84, 80, 74, 70, 65, 60, 55, 50, 45, 40, 35, 30] {
+            let task = cascade_task(SUBAGENT_NOW_MS);
+            let Some(content) = build_subagent_content(&task, None, Some(columns), SUBAGENT_NOW_MS) else {
+                continue;
+            };
+
+            let budget = columns - 4;
+            let visible_width = display_width(&strip_ansi(&content));
+            assert!(
+                visible_width <= budget,
+                "columns={columns}: 表示幅{visible_width}が予算{budget}を超えている: {content}"
+            );
+        }
     }
 }
