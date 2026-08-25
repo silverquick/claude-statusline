@@ -22,6 +22,9 @@ const POWERLINE_RIGHT: char = '\u{e0b0}';
 // 同じ背景どうしを区切る細い楔。黒い空セルのあいだだけで使う。
 const POWERLINE_RIGHT_THIN: char = '\u{e0b1}';
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+// 会話ログは数メガバイトになるので、毎秒の再描画で全体を読まないよう
+// 末尾だけを見る。Effort・直近の応答・直近のプロンプトで共有する。
+const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Color {
@@ -55,6 +58,45 @@ const WORKTREE_BACKGROUND: Color = rgb(92, 72, 165);
 const DIFF_BACKGROUND: Color = rgb(39, 174, 96);
 const IDENTITY_BACKGROUND: Color = rgb(45, 106, 79);
 const COST_BACKGROUND: Color = rgb(176, 187, 200);
+// Ultracode は Effort の段階ではなくモード指定なので、Effort とは別の面に出す。
+// 同じ紫系だが彩度を上げて別物と分かるようにする（Effort との色差 22.2）。
+const ULTRACODE_BACKGROUND: Color = rgb(130, 45, 160);
+// タスク進捗。Python 版の青 rgb(35,85,110) は Git の青と色差 9.6 しかなく
+// 境界が消えたため、行内のどの色とも 36 以上離れる暗いワイン色に変更した。
+const TASK_BACKGROUND: Color = rgb(100, 48, 64);
+// 本体行の下に積む2本のピル。単独セグメントなので隣接の制約は無く、
+// 文字色とのコントラストだけを満たせばよい。
+const SUMMARY_BACKGROUND: Color = rgb(42, 52, 65);
+const MESSAGE_BACKGROUND: Color = rgb(32, 35, 42);
+const LIGHT_TEXT: Color = rgb(240, 243, 248);
+const MUTED_TEXT: Color = rgb(175, 182, 195);
+// サブエージェント行の状態と実行中ツール。状態は行の先頭に必ず置く。
+// ツールは working / running のときだけ出るので、他の状態色とは隣接しない。
+const TOOL_BACKGROUND: Color = rgb(42, 75, 95);
+const STATUS_WORKING_BACKGROUND: Color = rgb(28, 100, 64);
+const STATUS_DONE_BACKGROUND: Color = rgb(35, 85, 60);
+const STATUS_BLOCKED_BACKGROUND: Color = rgb(140, 100, 20);
+// failed は赤で表したいが、モデルの赤 rgb(185,49,49) とは色差 12.9 しかなく、
+// 隣接すると境界が消える。暗く彩度を落として 29.8 まで離した。
+const STATUS_FAILED_BACKGROUND: Color = rgb(112, 30, 38);
+const STATUS_IDLE_BACKGROUND: Color = rgb(45, 48, 55);
+// 行数に収まらなかった分をまとめる面。単独セグメントなので隣接の制約は無い。
+const OVERFLOW_BACKGROUND: Color = rgb(42, 48, 58);
+
+/// 作業中のモデル名を1文字ずつ塗り替えるグラデーション。赤地の上に置くので、
+/// どのコマでも白〜淡い金に留めて WCAG AA を下回る色は入れない。
+const MODEL_SHIMMER_GRADIENT: [Color; 6] = [
+    rgb(255, 255, 255),
+    rgb(255, 245, 180),
+    rgb(255, 230, 130),
+    // Python 版はここが rgb(255,215,80) だったが、赤地では比 4.25 で AA に
+    // 届かない。金色の印象を保ったまま最小限だけ明るくして 4.59 にしている。
+    rgb(255, 225, 120),
+    rgb(255, 235, 150),
+    rgb(235, 245, 255),
+];
+// 1行に載せるサブエージェントの上限。これを超えた分は `+n more` にまとめる。
+const SUBAGENT_ROWS: usize = 8;
 const WHITE: Color = rgb(255, 255, 255);
 const DARK_TEXT: Color = rgb(30, 36, 45);
 
@@ -131,6 +173,19 @@ struct Repository {
     is_unborn: bool,
 }
 
+#[derive(Clone, Copy, Default)]
+struct GitStatus {
+    ahead: i64,
+    behind: i64,
+    untracked: i64,
+}
+
+#[derive(Default)]
+struct TasksProgress {
+    counts: Option<(usize, usize)>,
+    active: Option<String>,
+}
+
 /// 利用率セグメントの明暗。5h と 7d は必ず隣り合うため、同じしきい値でも
 /// 背景が一致しないよう、片方を暗い系、もう片方を明るい系に固定する。
 #[derive(Clone, Copy)]
@@ -178,6 +233,9 @@ fn build_status_line(root: &Value) -> String {
     let rates = get_rate_limits(root);
     let repository = find_repository(&directory, get_workspace_worktree(root));
     let main_effort = get_main_effort(root);
+    let configuration = get_config_directory();
+    let session_id = get_string(root, "session_id").unwrap_or("").to_string();
+    let tasks = get_tasks_progress(&session_id, &configuration, &directory);
 
     // コンテキストは全帯を明るい系で揃えているため、文字色は常に暗色でよい。
     let context_foreground = DARK_TEXT;
@@ -198,21 +256,32 @@ fn build_status_line(root: &Value) -> String {
         Segment {
             background: MODEL_BACKGROUND,
             foreground: WHITE,
-            text: format!(" {} ", get_model_name(root)),
+            text: create_model_text(root, &configuration, &session_id),
         },
-        Segment {
-            background: EFFORT_BACKGROUND,
-            foreground: WHITE,
-            text: create_effort_text(&main_effort),
-        },
-        Segment {
-            background: context_background,
-            foreground: context_foreground,
-            text: create_context_text(&context, context_foreground, context_background),
-        },
-        create_rate_segment("5h", rates.five_hour, RateScale::Dark),
-        create_rate_segment("7d", rates.seven_day, RateScale::Light),
     ];
+
+    // ultracode は Effort の段階ではなくモード指定で、Effort 自体は `xhigh`
+    // として報告される。ゲージには出しようがないので独立したバッジにする。
+    if is_ultracode(root) {
+        segments.push(Segment {
+            background: ULTRACODE_BACKGROUND,
+            foreground: WHITE,
+            text: " \u{1f680} Ultracode ".to_string(),
+        });
+    }
+
+    segments.push(Segment {
+        background: EFFORT_BACKGROUND,
+        foreground: WHITE,
+        text: create_effort_text(&main_effort),
+    });
+    segments.push(Segment {
+        background: context_background,
+        foreground: context_foreground,
+        text: create_context_text(&context, context_foreground, context_background),
+    });
+    segments.push(create_rate_segment("5h", rates.five_hour, RateScale::Dark));
+    segments.push(create_rate_segment("7d", rates.seven_day, RateScale::Light));
 
     // Claude Code が渡すのはこのセッションの推定コストだけで、アカウントの
     // 課金上限や当月の使用量は入力に含まれない。上限がないのでバーは置かず、
@@ -225,12 +294,29 @@ fn build_status_line(root: &Value) -> String {
         });
     }
 
+    // 進行中のタスクが「何か」はサマリ行に回し、ここには件数だけを出す。
+    // 幅が一定なので、行が伸び縮みして他のセグメントの位置が動かない。
+    if let Some((completed, total)) = tasks.counts {
+        segments.push(Segment {
+            background: TASK_BACKGROUND,
+            foreground: WHITE,
+            text: format!(" \u{2713} {}/{} tasks ", completed, total),
+        });
+    }
+
     if let Some(repository) = repository {
         if let Some(branch) = repository.branch.as_deref() {
+            // git の呼び出しは2つあり、どちらも十数ミリ秒かかる。逐次に走らせると
+            // 待ち時間がそのまま足し算になるので、同時に投げて両方を待つ。
+            let status_directory = directory.clone();
+            let status = thread::spawn(move || get_git_status(&status_directory));
+            let diff = get_diff_stat(&repository, &directory);
+            let status = status.join().unwrap_or(None);
+
             segments.push(Segment {
                 background: GIT_BACKGROUND,
                 foreground: WHITE,
-                text: format!(" \u{2387} {} ", clean_text(branch)),
+                text: format!(" \u{2387} {} ", format_branch(&clean_text(branch), status)),
                 });
 
             if let Some(worktree) = repository.worktree.as_deref() {
@@ -243,7 +329,7 @@ fn build_status_line(root: &Value) -> String {
                 }
             }
 
-            if let Some((added, deleted)) = get_diff_stat(&repository, &directory) {
+            if let Some((added, deleted)) = diff {
                 if added > 0 || deleted > 0 {
                     // 明るい緑地なので、白文字ではコントラスト比 2.87 しか出ない。
                     segments.push(Segment {
@@ -256,7 +342,22 @@ fn build_status_line(root: &Value) -> String {
         }
     }
 
-    render_powerline(&segments)
+    // 端末幅を超える分は次の行へ送る。セグメント単位でしか折れないので、
+    // 1つで幅を超えるセグメントはそのまま1行を占める。
+    let columns = get_columns(root);
+    let mut lines = wrap_segments(&segments, columns);
+
+    // 本体行の下に積む2本のピル。上が「いま何をしているか」、下が
+    // 「直前に何を頼まれたか」で、どちらも取れなければ行ごと出さない。
+    if let Some(summary) = get_summary(root, &tasks) {
+        lines.push(render_pill(&summary, LIGHT_TEXT, SUMMARY_BACKGROUND, columns));
+    }
+
+    if let Some(message) = get_last_prompt(root, &configuration, &session_id) {
+        lines.push(render_pill(&message, MUTED_TEXT, MESSAGE_BACKGROUND, columns));
+    }
+
+    lines.join("\n")
 }
 
 fn get_model_name(root: &Value) -> String {
@@ -272,6 +373,122 @@ fn get_model_name(root: &Value) -> String {
         Some(name) if !is_blank(name) => clean_text(name),
         _ => "?".to_string(),
     }
+}
+
+/// モデル名。ターンが進行中のあいだは1文字ずつ色を送って光らせる。静止画では
+/// 分からないが、毎秒の再描画で名前が左から右へ流れて見える。
+fn create_model_text(root: &Value, configuration: &Path, session_id: &str) -> String {
+    let name = get_model_name(root);
+    if !is_active_state(root, configuration, session_id) {
+        return format!(" {} ", name);
+    }
+
+    let phase = current_phase();
+    let mut text = String::from(" ");
+    for (index, character) in name.chars().enumerate() {
+        text.push_str(&foreground(
+            MODEL_SHIMMER_GRADIENT[(index + phase) % MODEL_SHIMMER_GRADIENT.len()],
+        ));
+        text.push(character);
+    }
+
+    // セグメント本来の文字色へ戻してから閉じる。背景は触っていないので、
+    // Powerline の接続には影響しない。
+    text.push_str(&foreground(WHITE));
+    text.push(' ');
+    text
+}
+
+/// ターンが進行中かどうか。Claude Code は入力にこれを含めないので、3つの
+/// 痕跡から推定する。どれも取れなければ、光らない静止した表示に落ちるだけ。
+fn is_active_state(root: &Value, configuration: &Path, session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+
+    let cache = configuration.join("cache");
+    // 1. ターン中だけ置かれるマーカー。書き手は hook 側の役目なので、
+    //    用意していない環境ではこの判定は常に false になる。
+    if cache.join("turn-active").join(session_id).exists() {
+        return true;
+    }
+
+    // 2. `--subagent` モードの自分自身が置いたマーカー。サブエージェントが
+    //    止まれば消すが、消し損ねても5秒で期限切れになる。
+    if is_recent(&cache.join("subagent-active").join(session_id), 5) {
+        return true;
+    }
+
+    // 3. ワークフローの journal に、結果がまだ書かれていない agent がある。
+    has_open_workflow_agent(root, session_id)
+}
+
+fn is_recent(path: &Path, seconds: u64) -> bool {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|elapsed| elapsed.as_secs() < seconds)
+}
+
+/// `<会話ログの親>/<session_id>/subagents/workflows/*/journal.jsonl` を見て、
+/// `started` に対応する `result` がまだ来ていない agent があるかを調べる。
+fn has_open_workflow_agent(root: &Value, session_id: &str) -> bool {
+    let Some(transcript) = get_string(root, "transcript_path") else {
+        return false;
+    };
+    let Some(project) = Path::new(transcript).parent() else {
+        return false;
+    };
+
+    let workflows = project.join(session_id).join("subagents").join("workflows");
+    let Ok(entries) = std::fs::read_dir(workflows) else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let Ok(contents) = std::fs::read_to_string(entry.path().join("journal.jsonl")) else {
+            continue;
+        };
+
+        let mut open: Vec<String> = Vec::new();
+        for line in contents.lines() {
+            let Ok(record) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(key) = get_string(&record, "key").filter(|value| !value.is_empty()) else {
+                continue;
+            };
+
+            match get_string(&record, "type") {
+                Some("started") => open.push(key.to_string()),
+                Some("result") => open.retain(|entry| entry.as_str() != key),
+                _ => {}
+            }
+        }
+
+        if !open.is_empty() {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// ultracode は Effort の段階ではなくモード指定として渡る。Effort 自体は
+/// `xhigh` として報告されるため、ゲージには出しようがない。
+fn is_ultracode(root: &Value) -> bool {
+    if std::env::var("CLAUDE_EFFORT")
+        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("ultracode"))
+    {
+        return true;
+    }
+
+    ["effort", "effortLevel", "reasoningEffort"].iter().any(|name| {
+        root.get(*name)
+            .and_then(|value| value.as_str().or_else(|| get_string(value, "level")))
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("ultracode"))
+    })
 }
 
 fn get_main_effort(root: &Value) -> String {
@@ -320,7 +537,9 @@ fn get_effort_step(label: &str) -> Option<usize> {
         "low" => Some(1),
         "medium" => Some(2),
         "high" => Some(3),
-        "xhigh" => Some(4),
+        // ultracode は独立した段階ではなくモード指定で、Effort 自体は xhigh
+        // として報告される。ラベルに直接来た場合も同じ段数として扱う。
+        "xhigh" | "ultracode" => Some(4),
         "max" => Some(5),
         _ => None,
     }
@@ -720,18 +939,8 @@ fn read_short_hostname() -> Option<String> {
 /// assistant 行を1件見つけるだけなので、全体を読む必要はない。
 /// 形式は公開仕様ではないので、読めなければゲージを出さないだけに留める。
 fn get_transcript_effort(root: &Value) -> Option<String> {
-    const TAIL_BYTES: u64 = 256 * 1024;
-
     let path = get_string(root, "transcript_path")?;
-    let tail = read_file_tail(Path::new(path), TAIL_BYTES)?;
-
-    let mut lines: Vec<&str> = tail.lines().collect();
-    // 先頭行は途中で切れている可能性があるので捨てる。
-    if tail.len() as u64 >= TAIL_BYTES && !lines.is_empty() {
-        lines.remove(0);
-    }
-
-    for line in lines.iter().rev() {
+    for line in read_tail_lines(Path::new(path), TRANSCRIPT_TAIL_BYTES).iter().rev() {
         if !line.contains("\"effort\"") {
             continue;
         }
@@ -767,6 +976,21 @@ fn read_file_tail(path: &Path, limit: u64) -> Option<String> {
     let mut buffer = Vec::new();
     file.take(limit).read_to_end(&mut buffer).ok()?;
     Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// ファイル末尾の行。先頭行は途中で切れている可能性があるので、実際に
+/// 打ち切りが起きたときだけ捨てる。
+fn read_tail_lines(path: &Path, limit: u64) -> Vec<String> {
+    let Some(tail) = read_file_tail(path, limit) else {
+        return Vec::new();
+    };
+
+    let mut lines: Vec<String> = tail.lines().map(str::to_string).collect();
+    if tail.len() as u64 >= limit && !lines.is_empty() {
+        lines.remove(0);
+    }
+
+    lines
 }
 
 fn get_session_cost(root: &Value) -> Option<f64> {
@@ -1166,22 +1390,97 @@ fn get_diff_stat(repository: &Repository, directory: &Path) -> Option<(i64, i64)
 }
 
 fn run_git_diff(directory: &Path, is_unborn: bool) -> Option<String> {
+    let mut arguments = vec!["diff", "--numstat"];
+    if is_unborn {
+        arguments.push("--cached");
+        arguments.push(EMPTY_TREE);
+    } else {
+        arguments.push("HEAD");
+    }
+    arguments.push("--");
+
+    run_git(directory, &arguments, Duration::from_secs(3))
+}
+
+/// 上流との差と未追跡ファイル。`--branch` を付ければ1回の呼び出しで両方
+/// 取れるので、git の起動は差分統計とあわせて2回に収まる。
+fn get_git_status(directory: &Path) -> Option<GitStatus> {
+    let stdout = run_git(
+        directory,
+        &["status", "--porcelain=v1", "--branch"],
+        Duration::from_secs(2),
+    )?;
+
+    Some(parse_git_status(&stdout))
+}
+
+fn parse_git_status(stdout: &str) -> GitStatus {
+    let mut status = GitStatus::default();
+    for line in stdout.split('\n') {
+        // 先頭行は `## main...origin/main [ahead 1, behind 2]`。上流が無い
+        // ブランチでは角括弧ごと現れないので、その場合は 0 のままでよい。
+        if let Some(branch) = line.strip_prefix("## ") {
+            let Some(open) = branch.find('[') else {
+                continue;
+            };
+            let Some(close) = branch[open..].find(']') else {
+                continue;
+            };
+
+            for part in branch[open + 1..open + close].split(',') {
+                let part = part.trim();
+                if let Some(count) = part.strip_prefix("ahead ") {
+                    status.ahead = count.trim().parse().unwrap_or(0);
+                } else if let Some(count) = part.strip_prefix("behind ") {
+                    status.behind = count.trim().parse().unwrap_or(0);
+                }
+            }
+        } else if line.starts_with("?? ") {
+            // `--porcelain=v1` の既定はディレクトリ単位でまとめるので、
+            // これは「未追跡の項目数」であってファイル数とは限らない。
+            status.untracked += 1;
+        }
+    }
+
+    status
+}
+
+/// ブランチ名に上流との差と未追跡数を添える。0 の項目は出さないので、
+/// 同期していてクリーンなときはブランチ名だけになる。
+fn format_branch(branch: &str, status: Option<GitStatus>) -> String {
+    let Some(status) = status else {
+        return branch.to_string();
+    };
+
+    let mut text = branch.to_string();
+    if status.ahead > 0 {
+        text.push_str(&format!(" \u{21e1}{}", status.ahead));
+    }
+    if status.behind > 0 {
+        text.push_str(&format!(" \u{21e3}{}", status.behind));
+    }
+    if status.untracked > 0 {
+        text.push_str(&format!(" ?{}", status.untracked));
+    }
+
+    text
+}
+
+/// git をタイムアウト付きで実行して標準出力を返す。`core.fsmonitor=false` は
+/// fsmonitor デーモンの起動待ちを避けるため、`--no-optional-locks` は
+/// statusline の再描画がインデックスを書き換えないために付けている。
+fn run_git(directory: &Path, arguments: &[&str], timeout: Duration) -> Option<String> {
     let mut command = Command::new("git");
     command
         .arg("-c")
         .arg("core.fsmonitor=false")
         .arg("--no-optional-locks")
         .arg("-C")
-        .arg(directory)
-        .arg("diff")
-        .arg("--numstat");
-    if is_unborn {
-        command.arg("--cached").arg(EMPTY_TREE);
-    } else {
-        command.arg("HEAD");
+        .arg(directory);
+    for argument in arguments {
+        command.arg(argument);
     }
     command
-        .arg("--")
         .current_dir(directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1203,7 +1502,7 @@ fn run_git_diff(directory: &Path, is_unborn: bool) -> Option<String> {
         buffer
     });
 
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1231,6 +1530,11 @@ fn run_git_diff(directory: &Path, is_unborn: bool) -> Option<String> {
 // ------------------------------------------------------------------ rendering
 
 fn render_powerline(segments: &[Segment]) -> String {
+    let parts: Vec<&Segment> = segments.iter().collect();
+    render_powerline_parts(&parts)
+}
+
+fn render_powerline_parts(segments: &[&Segment]) -> String {
     if segments.is_empty() {
         return String::new();
     }
@@ -1259,6 +1563,52 @@ fn render_powerline(segments: &[Segment]) -> String {
     output
 }
 
+/// 端末幅を超えた分を次の行へ送る。Powerline の実表示幅は「各セグメントの
+/// 表示幅の合計＋セグメント数」（セグメント間の楔 n-1 個＋末尾の楔1個）なので、
+/// セグメント1つにつき幅＋1で数える。1つだけで幅を超えるセグメントは、
+/// そこで折っても短くならないのでそのまま1行を占める。
+fn wrap_segments(segments: &[Segment], columns: i64) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current: Vec<&Segment> = Vec::new();
+    let mut width = 0i64;
+
+    for segment in segments {
+        let segment_width = display_width(&strip_ansi(&segment.text)) + 1;
+        if !current.is_empty() && width + segment_width > columns {
+            lines.push(render_powerline_parts(&current));
+            current.clear();
+            width = 0;
+        }
+
+        current.push(segment);
+        width += segment_width;
+    }
+
+    if !current.is_empty() {
+        lines.push(render_powerline_parts(&current));
+    }
+
+    lines
+}
+
+/// 本体行の下に積む、セグメント1つだけの行。収まらない分は末尾を `…` にする。
+/// 前後の空白と末尾の楔で3桁使うので、その分を引いた幅に収める。
+fn render_pill(text: &str, text_color: Color, background_color: Color, columns: i64) -> String {
+    let available = (columns - 4).max(10);
+    let text = clean_text(text.trim());
+    let text = if display_width(&text) > available {
+        truncate_to_width(&text, available - 1) + "\u{2026}"
+    } else {
+        text
+    };
+
+    render_powerline(&[Segment {
+        background: background_color,
+        foreground: text_color,
+        text: format!(" {} ", text),
+    }])
+}
+
 fn foreground(color: Color) -> String {
     format!("{}38;2;{};{};{}m", ESCAPE, color.red, color.green, color.blue)
 }
@@ -1274,26 +1624,39 @@ fn write_subagent_status(root: &Value) {
         return;
     };
 
+    // 本体の statusline はターン中かどうかを入力から知れないので、
+    // サブエージェントが動いているあいだはここで痕跡を残す。
+    let configuration = get_config_directory();
+    write_subagent_marker(&configuration, get_string(root, "session_id").unwrap_or(""), tasks);
+
     let session_effort = get_effort(root).or_else(|| get_transcript_effort(root));
     let columns = get_number(root, "columns").filter(|value| *value > 0.0).map(|value| value as i64);
     let now_ms = current_time_millis();
 
-    for task in tasks {
-        if !task.is_object() {
-            continue;
-        }
+    for (id, content) in build_subagent_rows(tasks, session_effort.as_deref(), columns, now_ms) {
+        println!(
+            "{{\"id\":{},\"content\":{}}}",
+            Value::String(id),
+            Value::String(content)
+        );
+    }
+}
 
-        let Some(id) = get_string(task, "id").filter(|value| !value.is_empty()) else {
-            continue;
-        };
+/// 動いているサブエージェントがあるあいだ `cache/subagent-active/<session_id>`
+/// を触り続ける。本体の statusline はこの更新時刻を見てモデル名を光らせる。
+/// 止まったら消すが、消し損ねても5秒で期限切れになる。
+fn write_subagent_marker(configuration: &Path, session_id: &str, tasks: &[Value]) {
+    if session_id.is_empty() {
+        return;
+    }
 
-        if let Some(content) = build_subagent_content(task, session_effort.as_deref(), columns, now_ms) {
-            println!(
-                "{{\"id\":{},\"content\":{}}}",
-                Value::String(id.to_string()),
-                Value::String(content)
-            );
-        }
+    let directory = configuration.join("cache").join("subagent-active");
+    let marker = directory.join(session_id);
+    if tasks.iter().any(is_running) {
+        let _ = std::fs::create_dir_all(&directory);
+        let _ = std::fs::write(&marker, current_time_millis().to_string());
+    } else {
+        let _ = std::fs::remove_file(&marker);
     }
 }
 
@@ -1304,22 +1667,280 @@ fn current_time_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// サブエージェント1行は、メインの statusline と同じ Powerline セグメントで
-/// 組む。順序は モデル→Effort→コンテキスト→進捗→エージェント→ラベル で固定。
-/// 既知のEffort には本体と同じ段数ゲージを付ける。コンテキストの使用率バーは
-/// 細いステータスパネルで幅を使いすぎるため省く。
+/// 畳んだ一群と単独のタスク。ワークフローは `review:bugs` のように接頭辞を
+/// 共有するタスクを並列に走らせるため、そのままでは数行が同じ仕事で埋まる。
+enum Unit<'a> {
+    Task(&'a Value),
+    Group(String, Vec<&'a Value>),
+}
+
+impl Unit<'_> {
+    /// 動いているものを上に、終わったものを下に置くための順位。
+    fn rank(&self) -> i32 {
+        match self {
+            Unit::Task(task) => get_status_rank(get_string(task, "status").unwrap_or("")),
+            Unit::Group(_, members) => members
+                .iter()
+                .map(|task| get_status_rank(get_string(task, "status").unwrap_or("")))
+                .min()
+                .unwrap_or(3),
+        }
+    }
+
+    /// 同じ順位のなかでは古い順。開始時刻が無いものは先頭に来る。
+    fn start(&self) -> f64 {
+        let earliest = |members: &[&Value]| {
+            members
+                .iter()
+                .filter_map(|task| get_number(task, "startTime"))
+                .fold(f64::INFINITY, f64::min)
+        };
+
+        let value = match self {
+            Unit::Task(task) => get_number(task, "startTime").unwrap_or(f64::INFINITY),
+            Unit::Group(_, members) => earliest(members),
+        };
+        if value.is_finite() {
+            value
+        } else {
+            0.0
+        }
+    }
+
+    fn ids(&self) -> Vec<String> {
+        match self {
+            Unit::Task(task) => task_id(task).into_iter().collect(),
+            Unit::Group(_, members) => members.iter().filter_map(|task| task_id(task)).collect(),
+        }
+    }
+}
+
+/// 表示する行を上から順に組む。Claude Code は入力に来た id すべてに対して
+/// 行が返ることを期待しているので、畳んだ側や溢れた側にも空の行を返す。
+fn build_subagent_rows(
+    tasks: &[Value],
+    session_effort: Option<&str>,
+    columns: Option<i64>,
+    now_ms: i64,
+) -> Vec<(String, String)> {
+    let mut units = group_tasks(tasks);
+    units.sort_by(|first, second| {
+        first
+            .rank()
+            .cmp(&second.rank())
+            .then(first.start().total_cmp(&second.start()))
+    });
+
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for unit in units.iter().take(SUBAGENT_ROWS) {
+        match unit {
+            Unit::Task(task) => {
+                let Some(id) = task_id(task) else {
+                    continue;
+                };
+                let content = build_subagent_content(task, session_effort, columns, now_ms);
+                rows.push((id, content.unwrap_or_default()));
+            }
+            Unit::Group(prefix, members) => {
+                let ids = unit.ids();
+                let Some(id) = ids.first() else {
+                    continue;
+                };
+                let content = build_group_content(prefix, members, session_effort, columns, now_ms);
+                rows.push((id.clone(), content.unwrap_or_default()));
+                // 畳んだ残りは行そのものを消す。空文字なら1行も占めない。
+                rows.extend(ids[1..].iter().map(|id| (id.clone(), String::new())));
+            }
+        }
+    }
+
+    // 溢れた分は件数だけを1行にまとめる。何件隠れているかが分からないと、
+    // 行が足りていないのか本当に動いていないのかを区別できない。
+    let overflow: Vec<String> = units
+        .iter()
+        .skip(SUBAGENT_ROWS)
+        .flat_map(|unit| unit.ids())
+        .collect();
+    if let Some((first, rest)) = overflow.split_first() {
+        let content = render_powerline(&[Segment {
+            background: OVERFLOW_BACKGROUND,
+            foreground: WHITE,
+            text: format!(" +{} more ", overflow.len()),
+        }]);
+        rows.push((first.clone(), content));
+        rows.extend(rest.iter().map(|id| (id.clone(), String::new())));
+    }
+
+    rows
+}
+
+/// ラベルの `:` より前を接頭辞とみなして畳む。1件しかない接頭辞は畳んでも
+/// 情報が減るだけなので単独のまま残す。
+fn group_tasks(tasks: &[Value]) -> Vec<Unit<'_>> {
+    let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
+    let mut standalone: Vec<&Value> = Vec::new();
+
+    for task in tasks {
+        if !task.is_object() || task_id(task).is_none() {
+            continue;
+        }
+
+        let prefix = get_subagent_label(task)
+            .and_then(|label| label.split_once(':').map(|(prefix, _)| prefix.trim().to_string()))
+            .filter(|prefix| !prefix.is_empty());
+
+        match prefix {
+            Some(prefix) => match groups.iter_mut().find(|(name, _)| *name == prefix) {
+                Some((_, members)) => members.push(task),
+                None => groups.push((prefix, vec![task])),
+            },
+            None => standalone.push(task),
+        }
+    }
+
+    let mut units: Vec<Unit> = Vec::new();
+    for (prefix, members) in groups {
+        if members.len() >= 2 {
+            units.push(Unit::Group(prefix, members));
+        } else {
+            standalone.extend(members);
+        }
+    }
+
+    units.extend(standalone.into_iter().map(Unit::Task));
+    units
+}
+
+/// 畳んだ一群の行。個々のモデルや Effort は揃っているのが普通なので、
+/// 代表として最も進んでいるタスクのものを出し、状態は件数で表す。
+fn build_group_content(
+    prefix: &str,
+    members: &[&Value],
+    session_effort: Option<&str>,
+    columns: Option<i64>,
+    now_ms: i64,
+) -> Option<String> {
+    let finished = members
+        .iter()
+        .filter(|task| matches!(get_string(task, "status"), Some("done" | "failed" | "stopped")))
+        .count();
+    let failed = members
+        .iter()
+        .any(|task| get_string(task, "status") == Some("failed"));
+    let (background, icon) = if failed {
+        (STATUS_FAILED_BACKGROUND, get_status_icon("failed"))
+    } else if finished == members.len() {
+        (STATUS_DONE_BACKGROUND, get_status_icon("done"))
+    } else {
+        (STATUS_WORKING_BACKGROUND, get_status_icon("working"))
+    };
+
+    // 先頭のタスクは、状態が進んでいる順・古い順に選ぶ。モデルと Effort は
+    // そこから借りる。
+    let mut sorted: Vec<&&Value> = members.iter().collect();
+    sorted.sort_by_key(|task| get_status_rank(get_string(task, "status").unwrap_or("")));
+    let representative = sorted.first().copied()?;
+
+    let status = Segment {
+        background,
+        foreground: WHITE,
+        text: format!(" {} {}/{} done ", icon, finished, members.len()),
+    };
+    let tool = members.iter().find_map(|task| build_tool_segment(task));
+    let elapsed = members
+        .iter()
+        .filter_map(|task| get_number(task, "startTime"))
+        .min_by(|first, second| first.total_cmp(second))
+        .and_then(|start| format_elapsed(Some(start), now_ms));
+
+    // 説明は最も古いタスクのものを使う。一群は同じ仕事を分担しているので、
+    // 最初に投入されたものの説明がその一群の目的をいちばんよく表す。
+    let mut oldest: Vec<&&Value> = members.iter().collect();
+    oldest.sort_by(|first, second| {
+        get_number(first, "startTime")
+            .unwrap_or(f64::INFINITY)
+            .total_cmp(&get_number(second, "startTime").unwrap_or(f64::INFINITY))
+    });
+    let description = oldest.first().and_then(|task| {
+        get_string(task, "description")
+            .filter(|value| !is_blank(value))
+            .map(|value| clean_text(value.trim()))
+    });
+
+    build_row(
+        RowParts {
+            status: Some(status),
+            tool,
+            task: representative,
+            active: members.iter().any(|task| is_running(task)),
+            label: Some(prefix.to_string()),
+            elapsed,
+            sparkline: None,
+            description,
+        },
+        session_effort,
+        columns,
+    )
+}
+
+struct RowParts<'a> {
+    status: Option<Segment>,
+    tool: Option<Segment>,
+    task: &'a Value,
+    active: bool,
+    label: Option<String>,
+    elapsed: Option<String>,
+    sparkline: Option<String>,
+    description: Option<String>,
+}
+
 fn build_subagent_content(
     task: &Value,
     session_effort: Option<&str>,
     columns: Option<i64>,
     now_ms: i64,
 ) -> Option<String> {
+    let label = get_subagent_label(task);
+    // 説明はラベルとは別に来ることがある。ラベルが無いときは説明がラベルに
+    // 繰り上がるので、その場合は行末に重ねて出さない。
+    let description = get_string(task, "description")
+        .filter(|value| !is_blank(value))
+        .map(|value| clean_text(value.trim()))
+        .filter(|value| Some(value.as_str()) != label.as_deref());
+
+    build_row(
+        RowParts {
+            status: build_status_segment(task),
+            tool: build_tool_segment(task),
+            task,
+            active: is_running(task),
+            label,
+            elapsed: format_elapsed(get_number(task, "startTime"), now_ms),
+            sparkline: build_sparkline(&get_number_array(task, "tokenSamples")),
+            description,
+        },
+        session_effort,
+        columns,
+    )
+}
+
+/// サブエージェント1行は、メインの statusline と同じ Powerline セグメントで
+/// 組む。順序は 状態→ツール→モデル→Effort→コンテキスト→進捗→エージェント
+/// →ラベル で固定。既知のEffort には本体と同じ段数ゲージを付ける。
+/// コンテキストの使用率バーは細いステータスパネルで幅を使いすぎるため省く。
+fn build_row(parts: RowParts, session_effort: Option<&str>, columns: Option<i64>) -> Option<String> {
+    let task = parts.task;
+    let status = parts.status;
+    let mut tool = parts.tool;
+
+    // 動いているあいだはモデル名を1文字ずつ光らせる。本体の statusline と
+    // 同じ演出で、この行がまだ生きていることを示す。
     let model = get_string(task, "model")
         .filter(|value| !is_blank(value))
         .map(|model| Segment {
             background: MODEL_BACKGROUND,
             foreground: WHITE,
-            text: format!(" {} ", prettify_model(&clean_text(model))),
+            text: create_shimmer_text(&prettify_model(&clean_text(model)), parts.active),
         });
 
     // Effort セグメントの中身は本体の statusline と同じ `create_effort_text` に
@@ -1349,24 +1970,22 @@ fn build_subagent_content(
         },
     });
 
-    let mut elapsed = format_elapsed(get_number(task, "startTime"), now_ms);
-    let mut sparkline = build_sparkline(&get_number_array(task, "tokenSamples"));
+    let mut elapsed = parts.elapsed;
+    let mut sparkline = parts.sparkline;
     let mut agent = get_agent_label(task).map(|label| Segment {
         background: IDENTITY_BACKGROUND,
         foreground: WHITE,
         text: format!(" {} ", label),
     });
-    let mut label = get_string(task, "label")
-        .filter(|value| !is_blank(value))
-        .or_else(|| get_string(task, "description").filter(|value| !is_blank(value)))
-        .map(clean_text)
-        .filter(|value| !is_blank(value));
+    let mut label = parts.label;
 
     let mut progress = build_progress_segment(elapsed.as_deref(), sparkline.as_deref());
 
     // コンテキストは上で常に `Some` にしているので、ここでは元データの有無
     // （`tokenCount` が取れたかどうか）で判定する。
-    if model.is_none()
+    if status.is_none()
+        && tool.is_none()
+        && model.is_none()
         && effort.is_none()
         && token_count.is_none()
         && progress.is_none()
@@ -1380,52 +1999,225 @@ fn build_subagent_content(
     let budget = columns.unwrap_or(60) - 4;
 
     // 予算を超える場合はユーザー承認済みの順で削る:
-    // ゲージ → ラベルの切り詰め/削除 → スパークライン → エージェント →
-    // 経過時間（結果として進捗セグメントが空になれば削除） → Effort。
-    // モデルとコンテキストは常に残す。
+    // ゲージ → ツール → ラベルの切り詰め/削除 → スパークライン → エージェント
+    // → 経過時間（結果として進捗セグメントが空になれば削除） → Effort。
+    // 状態・モデル・コンテキストは常に残す。
 
     // ゲージを最初に落とすのは、段階名という情報そのものは残したまま
     // 一度に11桁空くからで、ラベルを削るより失うものが小さい。
-    if subagent_width(&[&model, &effort, &context, &progress, &agent, &label_segment]) > budget {
+    if subagent_width(&[&status, &tool, &model, &effort, &context, &progress, &agent, &label_segment]) > budget {
         if let (Some(segment), Some(label)) = (effort.as_mut(), effort_label.as_deref()) {
             segment.text = format!(" {} ", label);
         }
     }
 
-    if subagent_width(&[&model, &effort, &context, &progress, &agent, &label_segment]) > budget {
-        let other_width = subagent_width(&[&model, &effort, &context, &progress, &agent]);
+    // ツールはラベルより先に落とす。数秒で移り変わるので、行が詰まっている
+    // 状況では最も揮発性が高く、次の再描画で別の名前になっている。
+    if subagent_width(&[&status, &tool, &model, &effort, &context, &progress, &agent, &label_segment]) > budget {
+        tool = None;
+    }
+
+    if subagent_width(&[&status, &tool, &model, &effort, &context, &progress, &agent, &label_segment]) > budget {
+        let other_width = subagent_width(&[&status, &tool, &model, &effort, &context, &progress, &agent]);
         label = truncate_or_drop_label(label, other_width, budget);
         label_segment = build_label_segment(label.as_deref());
     }
 
-    if subagent_width(&[&model, &effort, &context, &progress, &agent, &label_segment]) > budget {
+    if subagent_width(&[&status, &tool, &model, &effort, &context, &progress, &agent, &label_segment]) > budget {
         sparkline = None;
         progress = build_progress_segment(elapsed.as_deref(), sparkline.as_deref());
     }
 
-    if subagent_width(&[&model, &effort, &context, &progress, &agent, &label_segment]) > budget {
+    if subagent_width(&[&status, &tool, &model, &effort, &context, &progress, &agent, &label_segment]) > budget {
         agent = None;
     }
 
-    if subagent_width(&[&model, &effort, &context, &progress, &agent, &label_segment]) > budget {
+    if subagent_width(&[&status, &tool, &model, &effort, &context, &progress, &agent, &label_segment]) > budget {
         elapsed = None;
         progress = build_progress_segment(elapsed.as_deref(), sparkline.as_deref());
     }
 
-    if subagent_width(&[&model, &effort, &context, &progress, &agent, &label_segment]) > budget {
+    if subagent_width(&[&status, &tool, &model, &effort, &context, &progress, &agent, &label_segment]) > budget {
         effort = None;
     }
 
-    let segments: Vec<Segment> = [model, effort, context, progress, agent, label_segment]
+    let used = subagent_width(&[&status, &tool, &model, &effort, &context, &progress, &agent, &label_segment]);
+    let segments: Vec<Segment> = [status, tool, model, effort, context, progress, agent, label_segment]
         .into_iter()
         .flatten()
         .collect();
 
     if segments.is_empty() {
-        None
-    } else {
-        Some(render_powerline(&segments))
+        return None;
     }
+
+    let rendered = render_powerline(&segments);
+    // 説明は Powerline の外に、地の色のまま薄く添える。行の予算が余っている
+    // ときだけ出すので、セグメントを押し出すことはない。
+    match parts.description.filter(|_| budget - used >= 12) {
+        Some(description) => Some(format!(
+            "{}{}2m \u{b7} {}{}0m",
+            rendered,
+            ESCAPE,
+            truncate_to_width(&description, budget - used - 3),
+            ESCAPE
+        )),
+        None => Some(rendered),
+    }
+}
+
+/// 状態はどの行にも必ず先頭に置く。入力に `status` が無い場合だけ省く。
+fn build_status_segment(task: &Value) -> Option<Segment> {
+    let status = get_string(task, "status").filter(|value| !is_blank(value))?;
+    Some(Segment {
+        background: get_status_background(status),
+        foreground: WHITE,
+        text: format!(" {} {} ", get_status_icon(status), clean_text(status.trim())),
+    })
+}
+
+/// 実行中のツールは動いているあいだだけ意味がある。終わったタスクに最後の
+/// ツールを出しても、いま何をしているかの手がかりにはならない。
+fn build_tool_segment(task: &Value) -> Option<Segment> {
+    if !is_running(task) {
+        return None;
+    }
+
+    let tool = ["tool", "currentTool", "activeTool"]
+        .iter()
+        .find_map(|name| get_string(task, name).filter(|value| !is_blank(value)))?;
+    Some(Segment {
+        background: TOOL_BACKGROUND,
+        foreground: WHITE,
+        text: format!(" {} {} ", get_tool_icon(tool), clean_text(tool.trim())),
+    })
+}
+
+fn is_running(task: &Value) -> bool {
+    matches!(get_string(task, "status"), Some("working" | "running"))
+}
+
+fn task_id(task: &Value) -> Option<String> {
+    get_string(task, "id")
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn get_subagent_label(task: &Value) -> Option<String> {
+    get_string(task, "label")
+        .filter(|value| !is_blank(value))
+        .or_else(|| get_string(task, "description").filter(|value| !is_blank(value)))
+        .map(|value| clean_text(value.trim()))
+        .filter(|value| !is_blank(value))
+}
+
+/// 動いているものが上、待たされているものが中、終わったものが下。
+/// 未知の状態は、もう動いていないものとして最後に置く。
+fn get_status_rank(status: &str) -> i32 {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "working" | "running" => 0,
+        "blocked" => 1,
+        "idle" => 2,
+        _ => 3,
+    }
+}
+
+/// 未知の状態を「動作中」の緑にすると、止まっている行が動いて見える。
+/// 判断できないものは待機の灰色に寄せる。
+fn get_status_background(status: &str) -> Color {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "working" | "running" => STATUS_WORKING_BACKGROUND,
+        "done" => STATUS_DONE_BACKGROUND,
+        "blocked" => STATUS_BLOCKED_BACKGROUND,
+        "failed" => STATUS_FAILED_BACKGROUND,
+        _ => STATUS_IDLE_BACKGROUND,
+    }
+}
+
+fn get_status_icon(status: &str) -> &'static str {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "working" | "running" => "\u{26a1}",
+        "done" => "\u{2713}",
+        "failed" => "\u{2717}",
+        _ => "\u{25cf}",
+    }
+}
+
+/// ラベルからその行の役目を推し量る。名前の付け方は自由なので、当てられない
+/// ものは総称のアイコンに落とす。判定順は上から先に一致したものを採る。
+///
+/// 異体字セレクタを伴う絵文字（🛡️ など）は使わない。端末によって1桁にも
+/// 2桁にもなり、幅の計算が合わなくなるため。
+fn get_role_icon(label: &str) -> &'static str {
+    let label = label.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|needle| label.contains(needle));
+
+    if has(&["sec", "guard", "audit", "auth"]) {
+        "\u{1f512}"
+    } else if has(&["review", "check", "inspect"]) {
+        "\u{1f9d0}"
+    } else if has(&["explore", "find", "search", "grep"]) {
+        "\u{1f50d}"
+    } else if has(&["plan", "arch", "design"]) {
+        "\u{1f4d0}"
+    } else if has(&["test", "spec", "eval"]) {
+        "\u{1f9ea}"
+    } else if has(&["fix", "patch", "edit", "write", "impl"]) {
+        "\u{1fa79}"
+    } else if has(&["build", "cargo", "compile", "run"]) {
+        "\u{1f528}"
+    } else if has(&["fork", "clone"]) {
+        "\u{26a1}"
+    } else if has(&["doc", "readme", "writeup"]) {
+        "\u{1f4dd}"
+    } else {
+        "\u{1f916}"
+    }
+}
+
+/// ツール名は増え続けるので、部分一致で拾って当てはまらないものは総称に
+/// 落とす。`sh` は `bash` にも一致するため、先に見る順序を保つ。
+fn get_tool_icon(tool: &str) -> &'static str {
+    let tool = tool.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|needle| tool.contains(needle));
+
+    if has(&["bash", "sh", "command", "powershell", "pwsh"]) {
+        "\u{1f527}"
+    } else if has(&["read"]) {
+        "\u{1f4d6}"
+    } else if has(&["edit", "write", "notebook"]) {
+        "\u{1f4dd}"
+    } else if has(&["agent", "fork"]) {
+        "\u{1f465}"
+    } else if has(&["search", "glob", "grep"]) {
+        "\u{1f50d}"
+    } else if has(&["web", "fetch", "crawl"]) {
+        "\u{1f310}"
+    } else if has(&["task"]) {
+        "\u{1f4cb}"
+    } else {
+        "\u{26a1}"
+    }
+}
+
+/// 文字を1つずつ塗り替えるグラデーション。動いていないときは素の文字列を返す。
+fn create_shimmer_text(text: &str, active: bool) -> String {
+    if !active {
+        return format!(" {} ", text);
+    }
+
+    let phase = current_phase();
+    let mut rendered = String::from(" ");
+    for (index, character) in text.chars().enumerate() {
+        rendered.push_str(&foreground(
+            MODEL_SHIMMER_GRADIENT[(index + phase) % MODEL_SHIMMER_GRADIENT.len()],
+        ));
+        rendered.push(character);
+    }
+
+    rendered.push_str(&foreground(WHITE));
+    rendered.push(' ');
+    rendered
 }
 
 /// Powerline の実表示幅は「各セグメントの表示幅の合計＋セグメント数」
@@ -1434,11 +2226,9 @@ fn build_subagent_content(
 fn subagent_width(pieces: &[&Option<Segment>]) -> i64 {
     let mut text_len = 0i64;
     let mut count = 0i64;
-    for piece in pieces {
-        if let Some(segment) = piece {
-            text_len += display_width(&strip_ansi(&segment.text));
-            count += 1;
-        }
+    for segment in pieces.iter().copied().flatten() {
+        text_len += display_width(&strip_ansi(&segment.text));
+        count += 1;
     }
     text_len + count
 }
@@ -1448,7 +2238,8 @@ fn subagent_width(pieces: &[&Option<Segment>]) -> i64 {
 /// 残らないなら（自明すぎて読めないので）セグメントごと落とす。
 fn truncate_or_drop_label(label: Option<String>, other_width: i64, budget: i64) -> Option<String> {
     let label = label?;
-    let allowed_content = budget - other_width - 1 - 2;
+    // 楔1桁、前後の空白2桁、ロールアイコンと区切りの空白で3桁を先に引く。
+    let allowed_content = budget - other_width - 1 - 2 - 3;
     if allowed_content < 10 {
         return None;
     }
@@ -1465,16 +2256,19 @@ fn truncate_or_drop_label(label: Option<String>, other_width: i64, budget: i64) 
 fn char_display_width(character: char) -> i64 {
     let code = character as u32;
 
-    // 結合文字（結合分音記号）は単独では桁を持たない。
-    if (0x0300..=0x036F).contains(&code) {
+    // 結合文字（結合分音記号）と異体字セレクタは単独では桁を持たない。
+    if (0x0300..=0x036F).contains(&code) || (0xFE00..=0xFE0F).contains(&code) {
         return 0;
     }
 
     // East Asian Wide / Fullwidth の主要な範囲。U+2581–2588（スパークライン）
     // は East Asian Ambiguous だがどの範囲にも含まれず、意図どおり1桁のまま
     // 扱われる。
-    const WIDE_RANGES: [(u32, u32); 16] = [
+    const WIDE_RANGES: [(u32, u32); 19] = [
         (0x1100, 0x115F),
+        // ⚡ U+26A1 は周囲が Ambiguous のなかで単独に Wide。ステータス行の
+        // 「作業中」に使うので、1文字だけ範囲として持つ。
+        (0x26A1, 0x26A1),
         (0x2E80, 0x303E),
         (0x3041, 0x33FF),
         (0x3400, 0x4DBF),
@@ -1487,7 +2281,11 @@ fn char_display_width(character: char) -> i64 {
         (0xFF00, 0xFF60),
         (0xFFE0, 0xFFE6),
         (0x1F300, 0x1F64F),
+        // 🚀（Ultracode バッジ）を含む交通・地図記号。
+        (0x1F680, 0x1F6FF),
         (0x1F900, 0x1F9FF),
+        // 🩹（修正のロールアイコン）を含む拡張記号。
+        (0x1FA00, 0x1FAFF),
         (0x20000, 0x2FFFD),
         (0x30000, 0x3FFFD),
     ];
@@ -1582,11 +2380,13 @@ fn build_progress_segment(elapsed: Option<&str>, sparkline: Option<&str>) -> Opt
     })
 }
 
+/// ラベルには役目を表すアイコンを添える。同じモデル・同じ Effort の行が
+/// 並んだとき、どれが何をしている行なのかを一目で見分けるための手がかり。
 fn build_label_segment(label: Option<&str>) -> Option<Segment> {
     label.map(|label| Segment {
         background: COST_BACKGROUND,
         foreground: DARK_TEXT,
-        text: format!(" {} ", label),
+        text: format!(" {} {} ", get_role_icon(label), label),
     })
 }
 
@@ -1750,6 +2550,386 @@ fn strip_date_suffix(text: &str) -> &str {
     }
 }
 
+// --------------------------------------------------- configuration and tasks
+
+/// `CLAUDE_CONFIG_DIR` があればそれ、無ければ `~/.claude`。
+fn get_config_directory() -> PathBuf {
+    match std::env::var("CLAUDE_CONFIG_DIR") {
+        Ok(directory) if !is_blank(&directory) => expand_home(directory.trim()),
+        _ => home_directory().join(".claude"),
+    }
+}
+
+fn home_directory() -> PathBuf {
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    if path == "~" {
+        return home_directory();
+    }
+
+    match path.strip_prefix("~/") {
+        Some(rest) => home_directory().join(rest),
+        None => PathBuf::from(path),
+    }
+}
+
+/// 折り返し幅。入力の `columns` が最優先で、無ければ環境変数を見る。端末への
+/// ioctl はクレートを増やすので使わず、どちらも取れなければ 80 桁とみなす。
+fn get_columns(root: &Value) -> i64 {
+    if let Some(columns) = get_number(root, "columns").filter(|value| *value > 0.0) {
+        return columns as i64;
+    }
+
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(80)
+}
+
+/// TodoWrite のタスク。セッション ID 直下、`session-` 付きの短縮名、そして
+/// このセッションが属するチームの順に探し、最初に見つかった一組を使う。
+/// 設定ディレクトリ自体も、明示指定・ゲートウェイ・既定の順で見る。
+fn get_tasks_progress(session_id: &str, configuration: &Path, directory: &Path) -> TasksProgress {
+    for root in task_roots(configuration) {
+        let Some(tasks) = task_directories(&root, session_id, directory)
+            .into_iter()
+            .map(|candidate| read_tasks(&candidate))
+            .find(|tasks| !tasks.is_empty())
+        else {
+            continue;
+        };
+
+        let total = tasks.len();
+        let completed = tasks
+            .iter()
+            .filter(|task| get_string(task, "status") == Some("completed"))
+            .count();
+        // 進行中が複数あることは想定していないが、あれば先頭だけを見せる。
+        let active = tasks
+            .iter()
+            .find(|task| get_string(task, "status") == Some("in_progress"))
+            .and_then(|task| {
+                get_string(task, "activeForm")
+                    .or_else(|| get_string(task, "subject"))
+                    .filter(|value| !is_blank(value))
+            })
+            .map(|value| clean_text(value.trim()));
+
+        return TasksProgress {
+            counts: Some((completed, total)),
+            active,
+        };
+    }
+
+    TasksProgress::default()
+}
+
+fn task_roots(configuration: &Path) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for candidate in [
+        configuration.to_path_buf(),
+        home_directory().join(".claude-openai-gw"),
+        home_directory().join(".claude"),
+    ] {
+        if candidate.is_dir() && !roots.contains(&candidate) {
+            roots.push(candidate);
+        }
+    }
+
+    roots
+}
+
+fn task_directories(root: &Path, session_id: &str, directory: &Path) -> Vec<PathBuf> {
+    let tasks = root.join("tasks");
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if !session_id.is_empty() {
+        candidates.push(tasks.join(session_id));
+        // チーム外のセッションでも、短縮名で置かれていることがある。
+        let prefix: String = session_id.chars().take(8).collect();
+        if prefix.chars().count() == 8 {
+            candidates.push(tasks.join(format!("session-{}", prefix)));
+        }
+    }
+
+    for team in find_teams(root, session_id, directory) {
+        let candidate = tasks.join(team);
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates
+}
+
+/// `teams/<名前>/config.json` のうち、このセッションがリーダーかメンバーで
+/// あるもの、あるいは同じ作業ディレクトリのメンバーを持つものを返す。
+fn find_teams(root: &Path, session_id: &str, directory: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root.join("teams")) else {
+        return Vec::new();
+    };
+
+    let mut teams: Vec<(u64, String, Value)> = Vec::new();
+    for entry in entries.flatten() {
+        let configuration = entry.path().join("config.json");
+        let Ok(contents) = std::fs::read_to_string(&configuration) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&contents) else {
+            continue;
+        };
+
+        // 並べ替えには更新時刻を使う。`createdAt` は形式が定まっておらず、
+        // 文字列で入っていることもあるので当てにしない。
+        let modified = std::fs::metadata(&configuration)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |elapsed| elapsed.as_secs());
+        teams.push((modified, entry.file_name().to_string_lossy().into_owned(), value));
+    }
+
+    // 新しい順に最大20件。全部を舐めると、毎秒の再描画で際限なく
+    // ファイルを開くことになる。
+    teams.sort_by_key(|team| std::cmp::Reverse(team.0));
+    teams.truncate(20);
+
+    teams
+        .into_iter()
+        .filter(|(_, _, value)| matches_team(value, session_id, directory))
+        .map(|(_, name, _)| name)
+        .collect()
+}
+
+fn matches_team(team: &Value, session_id: &str, directory: &Path) -> bool {
+    let members = team.get("members").and_then(Value::as_array);
+    if !session_id.is_empty() {
+        let lead = get_string(team, "leadSessionId").unwrap_or("");
+        let prefix: String = session_id.chars().take(8).collect();
+        if lead == session_id || (prefix.chars().count() == 8 && lead.starts_with(&prefix)) {
+            return true;
+        }
+
+        if members.is_some_and(|members| {
+            members.iter().any(|member| {
+                get_string(member, "agentId").is_some_and(|agent| agent.contains(session_id))
+            })
+        }) {
+            return true;
+        }
+    }
+
+    // セッション ID で結び付かない場合の最後の手がかりが作業ディレクトリ。
+    let directory = directory.to_string_lossy();
+    members.is_some_and(|members| {
+        members
+            .iter()
+            .any(|member| get_string(member, "cwd") == Some(directory.as_ref()))
+    })
+}
+
+fn read_tasks(directory: &Path) -> Vec<Value> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+
+    let mut tasks = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+
+        // `.` 始まりは書きかけの一時ファイル。
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(task) = serde_json::from_str::<Value>(&contents) else {
+            continue;
+        };
+
+        if task.is_object() && get_string(&task, "status") != Some("deleted") {
+            tasks.push(task);
+        }
+    }
+
+    tasks
+}
+
+// ---------------------------------------------------- summary and last prompt
+
+/// サマリ行。進行中のタスクがあればそれを、無ければ会話ログの末尾にある
+/// 直近の応答の書き出しを使う。
+///
+/// Python 版は `cache/turn-summary/<session_id>.txt` を読んでいたが、この
+/// ファイルを書くのは Claude Code 本体でも本リポジトリでもなく、書き手を
+/// 用意していない環境では行が常に消える。そのため取得元を差し替えている。
+fn get_summary(root: &Value, tasks: &TasksProgress) -> Option<String> {
+    if let Some(active) = tasks.active.as_deref().filter(|value| !is_blank(value)) {
+        return Some(format!("\u{25b6} {}", active));
+    }
+
+    get_last_assistant_text(root)
+}
+
+/// 会話ログの末尾から、サブエージェントのものではない直近の応答テキストを
+/// 1件取る。`message.content` は文字列と配列のどちらもありうる。
+fn get_last_assistant_text(root: &Value) -> Option<String> {
+    let path = get_string(root, "transcript_path")?;
+    for line in read_tail_lines(Path::new(path), TRANSCRIPT_TAIL_BYTES).iter().rev() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if get_string(&entry, "type") != Some("assistant") {
+            continue;
+        }
+        if entry.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+
+        let Some(message) = get_object(&entry, "message") else {
+            continue;
+        };
+        if let Some(text) = get_message_text(message).filter(|value| !is_blank(value)) {
+            return Some(clean_text(text.trim()));
+        }
+    }
+
+    None
+}
+
+/// `content` が文字列ならそのまま、配列なら `text` ブロックだけをつなぐ。
+/// 思考ブロックやツール呼び出しは、頼まれた内容の要約にならないので除く。
+fn get_message_text(message: &Value) -> Option<String> {
+    let content = message.as_object()?.get("content")?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+
+    let mut text = String::new();
+    for block in content.as_array()? {
+        if get_string(block, "type") != Some("text") {
+            continue;
+        }
+        if let Some(part) = get_string(block, "text").filter(|value| !is_blank(value)) {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(part.trim());
+        }
+    }
+
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// 直近に人が打ったプロンプト。会話ログから取れない場合だけ `history.jsonl`
+/// に落ちる。
+fn get_last_prompt(root: &Value, configuration: &Path, session_id: &str) -> Option<String> {
+    get_transcript_prompt(root).or_else(|| get_history_prompt(configuration, session_id))
+}
+
+/// 会話ログの user 行のうち、人がその場で打ったものだけを拾う。サブエージェント
+/// 経由・ツール結果・スラッシュコマンドの展開・システムからの差し込みは、
+/// どれも `origin.kind` や `promptSource` で区別できる。
+///
+/// Python 版は `isMeta` が `false` であることを条件にしていたが、実際の
+/// 会話ログでは通常の入力にこのキー自体が現れないため、条件が常に成立せず
+/// 会話ログ側は素通りしていた。ここでは「真でないこと」に緩めている。
+fn get_transcript_prompt(root: &Value) -> Option<String> {
+    let path = get_string(root, "transcript_path")?;
+    for line in read_tail_lines(Path::new(path), TRANSCRIPT_TAIL_BYTES).iter().rev() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if get_string(&entry, "type") != Some("user") {
+            continue;
+        }
+        if entry.get("isSidechain").and_then(Value::as_bool) == Some(true)
+            || entry.get("isMeta").and_then(Value::as_bool) == Some(true)
+        {
+            continue;
+        }
+        if ["toolUseResult", "sourceToolAssistantUUID", "sourceToolUseID"]
+            .iter()
+            .any(|name| entry.get(*name).is_some_and(|value| !value.is_null()))
+        {
+            continue;
+        }
+        if get_object(&entry, "origin").and_then(|origin| get_string(origin, "kind")) != Some("human")
+            || get_string(&entry, "promptSource") != Some("typed")
+        {
+            continue;
+        }
+
+        let Some(message) = get_object(&entry, "message") else {
+            continue;
+        };
+        if get_string(message, "role") != Some("user") {
+            continue;
+        }
+
+        // 配列の `content` はツール結果を含む転記なので、その場で打った
+        // 文字列だけを受け付ける。
+        if let Some(text) = message
+            .as_object()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .filter(|value| !is_blank(value))
+        {
+            return Some(clean_text(text.trim()));
+        }
+    }
+
+    None
+}
+
+fn get_history_prompt(configuration: &Path, session_id: &str) -> Option<String> {
+    if session_id.is_empty() {
+        return None;
+    }
+
+    for line in read_tail_lines(&configuration.join("history.jsonl"), TRANSCRIPT_TAIL_BYTES)
+        .iter()
+        .rev()
+    {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if get_string(&record, "sessionId") != Some(session_id) {
+            continue;
+        }
+
+        let text = clean_text(get_string(&record, "display").unwrap_or("").trim());
+        let text = text.trim();
+        // スラッシュコマンドと貼り付けの見出しは、頼まれた内容そのものではない。
+        if text.is_empty() || text.starts_with('/') || is_pasted_placeholder(text) {
+            continue;
+        }
+
+        return Some(text.to_string());
+    }
+
+    None
+}
+
+fn is_pasted_placeholder(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix("[Pasted text #") else {
+        return false;
+    };
+
+    rest.chars().next().is_some_and(|character| character.is_ascii_digit())
+}
+
 // -------------------------------------------------------------------- helpers
 
 fn capitalize(value: &str) -> String {
@@ -1802,6 +2982,13 @@ mod tests {
         RATE_DARK_LOW_BACKGROUND,
         RATE_DARK_MEDIUM_BACKGROUND,
         RATE_DARK_HIGH_BACKGROUND,
+    ];
+    const STATUS_BANDS: [Color; 5] = [
+        STATUS_WORKING_BACKGROUND,
+        STATUS_DONE_BACKGROUND,
+        STATUS_BLOCKED_BACKGROUND,
+        STATUS_FAILED_BACKGROUND,
+        STATUS_IDLE_BACKGROUND,
     ];
     const RATE_LIGHT_BANDS: [Color; 3] = [
         RATE_LIGHT_LOW_BACKGROUND,
@@ -1916,6 +3103,38 @@ mod tests {
         pairs.push(("progress → label".to_string(), WORKTREE_BACKGROUND, COST_BACKGROUND));
         pairs.push(("agent → label".to_string(), IDENTITY_BACKGROUND, COST_BACKGROUND));
 
+        // --- Ultracode バッジとタスク進捗 ---
+        // バッジはモデルと Effort のあいだにだけ入る。タスク進捗はコストの
+        // 次に置くが、コストは入力に含まれないことがあるので 7d の次も来る。
+        pairs.push(("model → ultracode".to_string(), MODEL_BACKGROUND, ULTRACODE_BACKGROUND));
+        pairs.push(("ultracode → effort".to_string(), ULTRACODE_BACKGROUND, EFFORT_BACKGROUND));
+        pairs.push(("cost → tasks".to_string(), COST_BACKGROUND, TASK_BACKGROUND));
+        pairs.push(("tasks → git".to_string(), TASK_BACKGROUND, GIT_BACKGROUND));
+        for (index, light) in RATE_LIGHT_BANDS.into_iter().enumerate() {
+            pairs.push((format!("7d[{index}] → tasks"), light, TASK_BACKGROUND));
+        }
+
+        // --- サブエージェント行の先頭（状態→ツール） ---
+        // 状態は必ず先頭に来る。ツールは working / running のときだけ出るので、
+        // 他の状態色とは隣接しない。ツールとモデルのあいだに入るものは無い。
+        for (index, status) in STATUS_BANDS.into_iter().enumerate() {
+            pairs.push((format!("status[{index}] → model"), status, MODEL_BACKGROUND));
+            pairs.push((format!("status[{index}] → effort"), status, EFFORT_BACKGROUND));
+            for (band, context) in CONTEXT_BANDS.into_iter().enumerate() {
+                pairs.push((format!("status[{index}] → context[{band}]"), status, context));
+            }
+        }
+        pairs.push((
+            "status[working] → tool".to_string(),
+            STATUS_WORKING_BACKGROUND,
+            TOOL_BACKGROUND,
+        ));
+        pairs.push(("tool → model".to_string(), TOOL_BACKGROUND, MODEL_BACKGROUND));
+        pairs.push(("tool → effort".to_string(), TOOL_BACKGROUND, EFFORT_BACKGROUND));
+        for (index, context) in CONTEXT_BANDS.into_iter().enumerate() {
+            pairs.push((format!("tool → context[{index}]"), TOOL_BACKGROUND, context));
+        }
+
         pairs
     }
 
@@ -1951,7 +3170,17 @@ mod tests {
             ("subagent progress", WORKTREE_BACKGROUND, WHITE),
             ("subagent agent", IDENTITY_BACKGROUND, WHITE),
             ("subagent label", COST_BACKGROUND, DARK_TEXT),
+            ("ultracode", ULTRACODE_BACKGROUND, WHITE),
+            ("tasks", TASK_BACKGROUND, WHITE),
+            ("subagent tool", TOOL_BACKGROUND, WHITE),
+            ("subagent overflow", OVERFLOW_BACKGROUND, WHITE),
+            // 本体行の下に積むピル。単独セグメントなので隣接の制約は無い。
+            ("summary", SUMMARY_BACKGROUND, LIGHT_TEXT),
+            ("message", MESSAGE_BACKGROUND, MUTED_TEXT),
         ];
+        for status in STATUS_BANDS {
+            pairs.push(("subagent status", status, WHITE));
+        }
         for context in CONTEXT_BANDS {
             pairs.push(("context", context, DARK_TEXT));
         }
@@ -2326,7 +3555,8 @@ mod tests {
     #[test]
     fn subagent_content_shows_everything_when_it_fits() {
         let task = cascade_task(SUBAGENT_NOW_MS);
-        let content = build_subagent_content(&task, None, Some(96), SUBAGENT_NOW_MS)
+        // ラベルにロールアイコンと区切りが付く分、収まりきる幅は3桁広い。
+        let content = build_subagent_content(&task, None, Some(99), SUBAGENT_NOW_MS)
             .expect("全フィールドがあるので出る");
 
         assert!(content.contains("Sonnet 5"), "モデル: {content}");
@@ -2368,7 +3598,7 @@ mod tests {
         let content = build_subagent_content(&task, None, Some(83), SUBAGENT_NOW_MS).unwrap();
 
         assert!(content.contains("..."), "{content}");
-        assert_eq!(content.matches('x').count(), 26, "切り詰め後に残る文字数: {content}");
+        assert_eq!(content.matches('x').count(), 23, "切り詰め後に残る文字数: {content}");
         assert!(content.contains("Sonnet 5") && content.contains("Xhigh") && content.contains("63k/1M 6%"));
         assert!(content.contains("2m14s") && content.contains('\u{2588}') && content.contains("Bot"));
     }
@@ -2708,5 +3938,232 @@ mod tests {
                 "columns={columns}: 表示幅{visible_width}が予算{budget}を超えている: {content}"
             );
         }
+    }
+
+    /// 光らせているあいだも、モデル名は赤地の上で AA を保つこと。どのコマも
+    /// 白〜淡い金なので、下回る色を足したときだけ落ちる。
+    #[test]
+    fn model_shimmer_stays_legible_on_red() {
+        for (index, color) in MODEL_SHIMMER_GRADIENT.into_iter().enumerate() {
+            let ratio = contrast_ratio(MODEL_BACKGROUND, color);
+            assert!(ratio >= 4.5, "コマ{index}: コントラスト比 {ratio:.2} は AA 未満");
+        }
+    }
+
+    /// 光らせても、読み取れる名前そのものは変わらないこと。
+    #[test]
+    fn model_shimmer_keeps_the_name_intact() {
+        assert_eq!(strip_ansi(&create_shimmer_text("Opus 5", true)), " Opus 5 ");
+        assert_eq!(create_shimmer_text("Opus 5", false), " Opus 5 ");
+    }
+
+    fn wrap_segment(text: &str) -> Segment {
+        Segment {
+            background: IDENTITY_BACKGROUND,
+            foreground: WHITE,
+            text: text.to_string(),
+        }
+    }
+
+    /// 端末幅を超えたら次の行へ送ること。行ごとに Powerline の終端が付くので、
+    /// 折り返しても装飾が次の行へ漏れない。
+    #[test]
+    fn segments_wrap_at_the_terminal_width() {
+        // 表示幅6＋楔1で1つ7桁。20桁なら2つで折り返す。
+        let segments = vec![wrap_segment(" aaaa "), wrap_segment(" bbbb "), wrap_segment(" cccc ")];
+        let lines = wrap_segments(&segments, 20);
+
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("aaaa") && lines[0].contains("bbbb"), "{}", lines[0]);
+        assert!(lines[1].contains("cccc"), "{}", lines[1]);
+        for line in &lines {
+            assert!(line.ends_with("\u{1b}[0m"), "行ごとに閉じる: {line}");
+            assert!(display_width(&strip_ansi(line)) <= 20, "{line}");
+        }
+    }
+
+    /// 1つだけで幅を超えるセグメントは、折っても短くならないのでそのまま置く。
+    #[test]
+    fn a_segment_wider_than_the_terminal_keeps_its_line() {
+        let long = format!(" {} ", "x".repeat(40));
+        let segments = vec![wrap_segment(" short "), wrap_segment(&long)];
+        let lines = wrap_segments(&segments, 20);
+
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[1].matches('x').count(), 40, "切り詰めはしない");
+    }
+
+    /// ピルは端末幅に収め、切ったことが分かるようにすること。
+    #[test]
+    fn pill_truncates_to_the_terminal_width() {
+        let pill = render_pill(&"あ".repeat(40), LIGHT_TEXT, SUMMARY_BACKGROUND, 30);
+        let visible = strip_ansi(&pill);
+
+        assert!(display_width(&visible) <= 30, "幅{}: {visible}", display_width(&visible));
+        assert!(visible.contains('\u{2026}'), "切ったことが分かる: {visible}");
+    }
+
+    /// 収まるときは切らないこと。
+    #[test]
+    fn pill_keeps_short_text_whole() {
+        let pill = render_pill("進行中", LIGHT_TEXT, SUMMARY_BACKGROUND, 80);
+        assert!(!strip_ansi(&pill).contains('\u{2026}'), "{pill}");
+    }
+
+    /// `git status --porcelain=v1 --branch` の1行目から上流との差を、
+    /// `??` の行数から未追跡の項目数を読む。
+    #[test]
+    fn branch_shows_divergence_and_untracked_counts() {
+        let status = parse_git_status(
+            "## main...origin/main [ahead 2, behind 3]\n?? a.txt\n?? b/\n M c.rs\n",
+        );
+
+        assert_eq!((status.ahead, status.behind, status.untracked), (2, 3, 2));
+        assert_eq!(format_branch("main", Some(status)), "main \u{21e1}2 \u{21e3}3 ?2");
+    }
+
+    /// 同期していてクリーンなら、ブランチ名だけになること。git が動かない
+    /// 環境（`None`）でも名前は出す。
+    #[test]
+    fn branch_stays_bare_when_in_sync_and_clean() {
+        assert_eq!(format_branch("main", Some(parse_git_status("## main...origin/main\n"))), "main");
+        assert_eq!(format_branch("main", Some(parse_git_status("## main\n"))), "main");
+        assert_eq!(format_branch("main", None), "main");
+    }
+
+    fn row_task(id: &str, label: &str, status: &str, started_ms_ago: i64) -> Value {
+        serde_json::json!({
+            "id": id,
+            "label": label,
+            "status": status,
+            "startTime": (SUBAGENT_NOW_MS - started_ms_ago) as f64,
+            "model": "claude-sonnet-5",
+            "tokenCount": 1000.0,
+            "contextWindowSize": 200_000.0,
+        })
+    }
+
+    /// 接頭辞を共有するタスクは1行に畳むこと。入力に来た id すべてに行を返す
+    /// 必要があるので、畳んだ側には空の行を返す。
+    #[test]
+    fn subagent_rows_fold_tasks_that_share_a_prefix() {
+        let tasks = vec![
+            row_task("a", "review:bugs", "working", 3_000),
+            row_task("b", "review:perf", "working", 2_000),
+        ];
+        let rows = build_subagent_rows(&tasks, None, Some(200), SUBAGENT_NOW_MS);
+
+        assert_eq!(rows.len(), 2, "id は全部返す: {rows:?}");
+        assert!(rows[0].1.contains("review"), "接頭辞で1行に畳む: {}", rows[0].1);
+        assert!(rows[0].1.contains("0/2 done"), "状態は件数で表す: {}", rows[0].1);
+        assert_eq!(rows[1].1, "", "畳んだ側は空の行");
+    }
+
+    /// 接頭辞が1件しかないなら畳まない。畳んでも情報が減るだけになる。
+    #[test]
+    fn subagent_rows_keep_a_lone_prefix_on_its_own_line() {
+        let tasks = vec![
+            row_task("a", "review:bugs", "working", 3_000),
+            row_task("b", "build the crate", "working", 2_000),
+        ];
+        let rows = build_subagent_rows(&tasks, None, Some(200), SUBAGENT_NOW_MS);
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|(_, content)| !content.is_empty()), "{rows:?}");
+    }
+
+    /// 行数に収まらない分は件数だけをまとめること。何件隠れているか分からないと、
+    /// 行が足りていないのか本当に動いていないのかを区別できない。
+    #[test]
+    fn subagent_rows_summarise_the_overflow() {
+        let tasks: Vec<Value> = (0..11)
+            .map(|index| {
+                row_task(&format!("id{index}"), &format!("task {index}"), "working", 1_000)
+            })
+            .collect();
+        let rows = build_subagent_rows(&tasks, None, Some(200), SUBAGENT_NOW_MS);
+
+        assert_eq!(rows.len(), 11, "id は全部返す");
+        assert!(rows[SUBAGENT_ROWS].1.contains("+3 more"), "{}", rows[SUBAGENT_ROWS].1);
+        assert!(
+            rows[SUBAGENT_ROWS + 1..].iter().all(|(_, content)| content.is_empty()),
+            "溢れた残りは空の行: {rows:?}"
+        );
+    }
+
+    /// 動いている行が上、終わった行が下。同じ状態なら古い順。
+    #[test]
+    fn subagent_rows_put_running_tasks_first() {
+        let tasks = vec![
+            row_task("done", "finished work", "done", 9_000),
+            row_task("live", "current work", "working", 1_000),
+            row_task("blocked", "waiting work", "blocked", 5_000),
+        ];
+        let rows = build_subagent_rows(&tasks, None, Some(200), SUBAGENT_NOW_MS);
+
+        let order: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(order, vec!["live", "blocked", "done"], "{order:?}");
+    }
+
+    /// ツールは動いているあいだだけ出す。終わった行に最後のツールを出しても、
+    /// いま何をしているかの手がかりにはならない。
+    #[test]
+    fn subagent_tool_shows_only_while_running() {
+        let mut task = row_task("a", "explore tree", "working", 1_000);
+        task["tool"] = Value::String("Bash".to_string());
+
+        let running = build_subagent_content(&task, None, Some(200), SUBAGENT_NOW_MS).unwrap();
+        assert!(running.contains("Bash"), "{running}");
+        assert!(running.contains("working"), "状態は先頭に出る: {running}");
+
+        task["status"] = Value::String("done".to_string());
+        let finished = build_subagent_content(&task, None, Some(200), SUBAGENT_NOW_MS).unwrap();
+        assert!(!finished.contains("Bash"), "{finished}");
+    }
+
+    /// 未知の状態を「動作中」の緑にすると、止まっている行が動いて見える。
+    #[test]
+    fn unknown_status_does_not_look_like_running() {
+        assert!(get_status_background("weird") == STATUS_IDLE_BACKGROUND);
+        assert_eq!(get_status_rank("weird"), 3, "未知は最後に置く");
+        assert_eq!(get_status_rank("running"), get_status_rank("working"));
+    }
+
+    /// アイコンに使う絵文字の桁数。ここがずれると、幅の計算だけが合っていても
+    /// 行が端末からあふれる。
+    #[test]
+    fn display_width_counts_icon_emoji_as_two_columns() {
+        assert_eq!(display_width("\u{1f680}"), 2, "🚀 Ultracode バッジ");
+        assert_eq!(display_width("\u{1fa79}"), 2, "🩹 修正のロール");
+        assert_eq!(display_width("\u{26a1}"), 2, "⚡ 作業中");
+        assert_eq!(display_width("\u{1f916}"), 2, "🤖 既定のロール");
+        assert_eq!(display_width("\u{2713}"), 1, "✓ は Ambiguous なので1桁");
+        assert_eq!(display_width("\u{25b6}"), 1, "▶ も1桁");
+        assert_eq!(display_width("\u{1f6e1}\u{fe0f}"), 2, "異体字セレクタは桁を持たない");
+    }
+
+    /// 貼り付けの見出しとスラッシュコマンドは、頼まれた内容そのものではない。
+    #[test]
+    fn pasted_placeholder_is_recognised() {
+        assert!(is_pasted_placeholder("[Pasted text #1 +30 lines]"));
+        assert!(!is_pasted_placeholder("[Pasted text #] "));
+        assert!(!is_pasted_placeholder("普通のプロンプト"));
+    }
+
+    /// ultracode は独立した段階ではなく xhigh として報告される。ラベルに直接
+    /// 来た場合も同じ段数として扱う。
+    #[test]
+    fn ultracode_uses_the_xhigh_gauge() {
+        assert_eq!(get_effort_step("ultracode"), get_effort_step("xhigh"));
+        assert_eq!(get_effort_step("Ultracode"), Some(4));
+    }
+
+    /// バッジは環境変数と入力のどちらからでも立つこと。
+    #[test]
+    fn ultracode_badge_reads_both_shapes() {
+        assert!(is_ultracode(&serde_json::json!({"effort": "ultracode"})));
+        assert!(is_ultracode(&serde_json::json!({"effort": {"level": "Ultracode"}})));
+        assert!(!is_ultracode(&serde_json::json!({"effort": {"level": "xhigh"}})));
+        assert!(!is_ultracode(&serde_json::json!({})));
     }
 }
