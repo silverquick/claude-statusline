@@ -1630,7 +1630,9 @@ fn write_subagent_status(root: &Value) {
     write_subagent_marker(&configuration, get_string(root, "session_id").unwrap_or(""), tasks);
 
     let session_effort = get_effort(root).or_else(|| get_transcript_effort(root));
-    let columns = get_number(root, "columns").filter(|value| *value > 0.0).map(|value| value as i64);
+    // 本体行と同じ順序（入力の `columns` → 端末サイズ問い合わせ → `COLUMNS`）で
+    // 幅を決める。取れなければ下流の `unwrap_or(60)` に委ねる。
+    let columns = resolve_columns(root);
     let now_ms = current_time_millis();
 
     for (id, content) in build_subagent_rows(tasks, session_effort.as_deref(), columns, now_ms) {
@@ -2575,18 +2577,198 @@ fn expand_home(path: &str) -> PathBuf {
     }
 }
 
-/// 折り返し幅。入力の `columns` が最優先で、無ければ環境変数を見る。端末への
-/// ioctl はクレートを増やすので使わず、どちらも取れなければ 80 桁とみなす。
-fn get_columns(root: &Value) -> i64 {
+/// OS に端末の桁数を尋ねる。依存クレートを増やさないため FFI は手書きし、
+/// どの経路で失敗しても `None` を返してパニックはしない。Claude Code は
+/// stdout をパイプで捕まえるので、標準出力がリダイレクトされていても読める
+/// 経路（Windows は `CONOUT$`、Unix は制御端末）を開いて問い合わせる。
+mod terminal_size {
+    #![allow(dead_code)]
+
+    /// 端末の桁数。取れなければ `None`。
+    #[cfg(windows)]
+    pub fn terminal_width() -> Option<i64> {
+        use std::os::raw::c_void;
+
+        type Handle = *mut c_void;
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Coord {
+            x: i16,
+            y: i16,
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct SmallRect {
+            left: i16,
+            top: i16,
+            right: i16,
+            bottom: i16,
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct ConsoleScreenBufferInfo {
+            size: Coord,
+            cursor_position: Coord,
+            attributes: u16,
+            window: SmallRect,
+            maximum_window_size: Coord,
+        }
+
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const OPEN_EXISTING: u32 = 3;
+        const INVALID_HANDLE_VALUE: Handle = -1_isize as Handle;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreateFileW(
+                file_name: *const u16,
+                desired_access: u32,
+                share_mode: u32,
+                security_attributes: *mut c_void,
+                creation_disposition: u32,
+                flags_and_attributes: u32,
+                template_file: Handle,
+            ) -> Handle;
+            fn GetConsoleScreenBufferInfo(
+                console_output: Handle,
+                info: *mut ConsoleScreenBufferInfo,
+            ) -> i32;
+            fn CloseHandle(object: Handle) -> i32;
+        }
+
+        // "CONOUT$" を NUL 終端の UTF-16 配列で渡す。
+        let name: [u16; 8] = [
+            b'C' as u16,
+            b'O' as u16,
+            b'N' as u16,
+            b'O' as u16,
+            b'U' as u16,
+            b'T' as u16,
+            b'$' as u16,
+            0,
+        ];
+
+        // SAFETY: すべて素の FFI 呼び出し。ハンドルは取得直後に閉じ、
+        // 失敗時は早期に `None` を返す。
+        unsafe {
+            let handle = CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                return None;
+            }
+
+            let mut info: ConsoleScreenBufferInfo = std::mem::zeroed();
+            let ok = GetConsoleScreenBufferInfo(handle, &mut info);
+            CloseHandle(handle);
+            if ok == 0 {
+                return None;
+            }
+
+            // バッファ（`dwSize`）ではなく可視ウィンドウの幅を使う。
+            let width = i64::from(info.window.right) - i64::from(info.window.left) + 1;
+            (width > 0).then_some(width)
+        }
+    }
+
+    /// 端末の桁数。取れなければ `None`。
+    #[cfg(unix)]
+    pub fn terminal_width() -> Option<i64> {
+        use std::os::raw::{c_char, c_int, c_ulong, c_void};
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Winsize {
+            ws_row: u16,
+            ws_col: u16,
+            ws_xpixel: u16,
+            ws_ypixel: u16,
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const TIOCGWINSZ: c_ulong = 0x5413;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        const TIOCGWINSZ: c_ulong = 0x4008_7468;
+
+        const O_RDONLY: c_int = 0;
+
+        extern "C" {
+            fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+            fn open(path: *const c_char, flags: c_int) -> c_int;
+            fn close(fd: c_int) -> c_int;
+        }
+
+        // SAFETY: `ws` はゼロ初期化した POD で、`ioctl` はそこへ書き込むだけ。
+        unsafe fn query(fd: c_int) -> Option<i64> {
+            let mut ws: Winsize = std::mem::zeroed();
+            let rc = ioctl(fd, TIOCGWINSZ, &mut ws as *mut Winsize as *mut c_void);
+            (rc == 0 && ws.ws_col > 0).then(|| i64::from(ws.ws_col))
+        }
+
+        // SAFETY: 下の FFI はいずれも fd かパスを渡すだけ。開いた fd は閉じる。
+        unsafe {
+            for fd in [2, 1, 0] {
+                if let Some(width) = query(fd) {
+                    return Some(width);
+                }
+            }
+
+            let path = b"/dev/tty\0";
+            let fd = open(path.as_ptr() as *const c_char, O_RDONLY);
+            if fd >= 0 {
+                let width = query(fd);
+                close(fd);
+                return width;
+            }
+        }
+
+        None
+    }
+
+    /// Windows でも Unix でもない環境では問い合わせる術がない。
+    #[cfg(not(any(windows, unix)))]
+    pub fn terminal_width() -> Option<i64> {
+        None
+    }
+}
+
+/// 折り返し幅の元になる桁数。優先順位は 入力の `columns` → OS への端末サイズ
+/// 問い合わせ → 環境変数 `COLUMNS`。どれも取れなければ `None`。
+///
+/// `COLUMNS` を問い合わせより後ろに回すのは、実端末より大きい古い値を
+/// エクスポートしてくる端末があるため（`COLUMNS=180` なのに実コンソールは
+/// 120 桁、という例を確認）。Claude Code は幅を入力に含めないので、`COLUMNS`
+/// だけを信じると折り返しが実幅を超えて行が切れてしまう。
+fn resolve_columns(root: &Value) -> Option<i64> {
     if let Some(columns) = get_number(root, "columns").filter(|value| *value > 0.0) {
-        return columns as i64;
+        return Some(columns as i64);
+    }
+
+    if let Some(width) = terminal_size::terminal_width().filter(|value| *value > 0) {
+        return Some(width);
     }
 
     std::env::var("COLUMNS")
         .ok()
         .and_then(|value| value.trim().parse::<i64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(80)
+}
+
+/// 折り返し幅。`resolve_columns` が何も返さなければ 80 桁とみなす。
+fn get_columns(root: &Value) -> i64 {
+    resolve_columns(root).unwrap_or(80)
 }
 
 /// TodoWrite のタスク。セッション ID 直下、`session-` 付きの短縮名、そして
@@ -4008,6 +4190,22 @@ mod tests {
     fn pill_keeps_short_text_whole() {
         let pill = render_pill("進行中", LIGHT_TEXT, SUMMARY_BACKGROUND, 80);
         assert!(!strip_ansi(&pill).contains('\u{2026}'), "{pill}");
+    }
+
+    /// 端末サイズの問い合わせは、どの環境でもパニックせず、取れたときは
+    /// 正の桁数を返すこと。CI では端末が無く `None` になることもある。
+    #[test]
+    fn terminal_width_never_panics() {
+        assert!(terminal_size::terminal_width().map_or(true, |width| width > 0));
+    }
+
+    /// 折り返し幅は入力の `columns` を最優先する。環境変数 `COLUMNS` や
+    /// 実端末の幅がどうであっても、この値がそのまま勝つこと。
+    #[test]
+    fn resolve_columns_prefers_the_json_value() {
+        let root = serde_json::json!({ "columns": 133.0 });
+        assert_eq!(resolve_columns(&root), Some(133));
+        assert_eq!(get_columns(&root), 133);
     }
 
     /// `git status --porcelain=v1 --branch` の1行目から上流との差を、
